@@ -24,7 +24,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor
 
 from i18n import tr
-from widgets.toast import toast_success, toast_error, toast_info
+from widgets.toast import toast_success, toast_error, toast_info, toast_warning
 from utils.dialogs import show_confirm
 from utils.credential_manager import get_password
 from config import (

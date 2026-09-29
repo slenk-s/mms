@@ -189,22 +189,22 @@ def _verify_zip(zip_path: str) -> bool:
     try:
         size = os.path.getsize(zip_path)
         if size < 22:
-            _log.error("verify_zip: file too small (%d bytes)", size)
+            _LOG.error("verify_zip: file too small (%d bytes)", size)
             return False
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
             if not names:
-                _log.error("verify_zip: empty zip")
+                _LOG.error("verify_zip: empty zip")
                 return False
             if zf.testzip() is not None:
-                _log.error("verify_zip: CRC mismatch in zip")
+                _LOG.error("verify_zip: CRC mismatch in zip")
                 return False
         return True
     except zipfile.BadZipFile as e:
-        _log.error("verify_zip: bad zip file: %s", e)
+        _LOG.error("verify_zip: bad zip file: %s", e)
         return False
     except Exception as e:
-        _log.error("verify_zip: %s", e)
+        _LOG.error("verify_zip: %s", e)
         return False
 
 
