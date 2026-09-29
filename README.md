@@ -122,13 +122,15 @@ pip install PySide6 pymysql fastapi uvicorn cython pytest PyJWT pyinstaller flak
 
 ### 1. 初始化数据库
 
-根据部署需要执行 `MySQL_/` 下的初始化 SQL 或对应模块/迁移脚本。典型全量初始化命令如下：
+数据库脚本位于 `MySQL_/Step/`，请在目标数据库中按编号顺序执行：`01_MMS_库存明细.sql` 至 `07_MMS_增加车间.sql`。可先登录 MySQL 客户端，再逐个执行 `source` 命令：
 
-```powershell
-mysql -u <用户名> -p < MySQL_/init.sql
+```sql
+source MySQL_/Step/01_MMS_库存明细.sql;
+source MySQL_/Step/02_MMS_领用记录.sql;
+-- 依次执行 03 至 07 脚本
 ```
 
-> 执行迁移前请先备份目标数据库，并按 SQL 文件中的依赖顺序执行。生产数据库的升级应在维护窗口完成。
+`01` 至 `06` 创建基础业务表，`07_MMS_增加车间.sql` 用于为既有表补充车间字段。执行迁移前请先备份目标数据库，并在生产环境维护窗口完成操作。
 
 ### 2. 配置本地环境
 
