@@ -32,6 +32,42 @@ class PageLoadResult:
     error: str | None
 
 
+class PageLoadState:
+    """主线程页面请求号与快照缓存状态，不持有任何 Qt Widget。"""
+
+    def __init__(self):
+        self._next_request_id = 0
+        self._latest_request_ids: dict[str, int] = {}
+        self._cache: dict[str, dict[str, list[dict]]] = {}
+
+    def begin_request(self, page_id: str) -> int:
+        if page_id not in PAGE_IDS:
+            raise ValueError(f"Unsupported page: {page_id}")
+        self._next_request_id += 1
+        self._latest_request_ids[page_id] = self._next_request_id
+        return self._next_request_id
+
+    def accept(self, result: PageLoadResult) -> bool:
+        if result.error is not None or result.payload is None:
+            return False
+        if self._latest_request_ids.get(result.page_id) != result.request_id:
+            return False
+        self._cache[result.page_id] = result.payload
+        return True
+
+    def get_cached(self, page_id: str) -> dict[str, list[dict]] | None:
+        return self._cache.get(page_id)
+
+    def invalidate(self, *page_ids: str) -> None:
+        targets = page_ids or tuple(PAGE_IDS)
+        for page_id in targets:
+            if page_id not in PAGE_IDS:
+                raise ValueError(f"Unsupported page: {page_id}")
+            self._next_request_id += 1
+            self._latest_request_ids[page_id] = self._next_request_id
+            self._cache.pop(page_id, None)
+
+
 def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 

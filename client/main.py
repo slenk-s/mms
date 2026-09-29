@@ -61,6 +61,7 @@ from views.register_view import RegisterView
 from views.asset_view import AssetView
 from views.config_view import ConfigView
 from views.user_manage_view import UserManageView
+from page_data_loader import PageDataLoadWorker, PageLoadResult, PageLoadState
 
 # 记住登录状态的文件路径
 REMEMBER_FILE = os.path.join(os.path.dirname(LOCAL_DB_PATH), REMEMBER_LOGIN_FILE)
@@ -455,6 +456,10 @@ class MainWindow(QMainWindow):
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._do_refresh)
+
+        # 页面加载状态：缓存和请求编号仅由 GUI 线程管理。
+        self._page_load_state = PageLoadState()
+        self._page_workers: dict[tuple[str, int], PageDataLoadWorker] = {}
 
         self._init_ui()
         self._connect_signals()
@@ -1079,69 +1084,89 @@ class MainWindow(QMainWindow):
         self._refresh_timer.start(300)
 
     def _do_refresh(self):
-        """执行刷新：先重新加载本地数据，再尝试云端拉取（如同步引擎已启动）"""
+        """强制异步重载当前页面，然后请求云端拉取。"""
         self._refresh_pending = True
-        self._load_data_for_page(self._current_page)
-        # 尝试云端拉取，获取其他客户端的最新数据（仅在同步引擎运行时有效）
+        self._invalidate_page_cache(self._current_page)
+        self._request_page_load(self._current_page, force=True)
         if self.sync_engine._is_running:
             self.status_bar.showMessage(tr("status.pulling_cloud"))
             self.sync_engine.refresh_pull()
 
     def _on_sync_completed(self, sync_type: str, count: int):
-        """同步完成回调
-
-        - 主动刷新（_refresh_pending=True）：通知用户刷新成功
-        - 周期同步拉取到新数据（count>0）：静默刷新当前页面，让其他电脑录入的数据自动可见
-        """
+        """同步完成后丢弃本地快照并异步重载当前页面。"""
+        if count > 0:
+            self._invalidate_page_cache()
         if self._refresh_pending:
             self._refresh_pending = False
-            self._load_data_for_page(self._current_page)
+            self._request_page_load(self._current_page, force=True)
             msg = tr("toast.records_pulled", count=count) if count > 0 else tr("toast.data_refreshed")
             from widgets.toast import toast_success
             toast_success(self, msg)
             self.status_bar.showMessage(msg)
         elif sync_type == "cycle" and count > 0:
-            # 其他电脑录入的数据已拉取到本地，静默刷新当前页面
-            self._load_data_for_page(self._current_page)
+            self._request_page_load(self._current_page, force=True)
             self.status_bar.showMessage(tr("toast.records_pulled", count=count))
 
-    def _load_data_for_page(self, page_id: str):
-        """按需加载当前视图所需数据（v4.1 性能优化核心）"""
+    def _invalidate_page_cache(self, *page_ids: str):
+        """使页面快照和进行中的旧请求失效。"""
+        self._page_load_state.invalidate(*page_ids)
+
+    def _request_page_load(self, page_id: str, force: bool = False):
+        """立即切页；缓存命中直接渲染，否则在线程中读取 SQLite 快照。"""
+        cached = None if force else self._page_load_state.get_cached(page_id)
+        if cached is not None:
+            self._apply_page_payload(page_id, cached)
+            return
+
+        request_id = self._page_load_state.begin_request(page_id)
+        worker = PageDataLoadWorker(
+            page_id, request_id, self.local_db.db_path, self.local_db._shared_db_path,
+            self._current_workshop, self,
+        )
+        key = (page_id, request_id)
+        self._page_workers[key] = worker
+        worker.loaded.connect(self._on_page_data_loaded)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_page_data_loaded(self, result: PageLoadResult):
+        """只在主线程应用仍有效的后台读取结果。"""
+        self._page_workers.pop((result.page_id, result.request_id), None)
+        if result.error:
+            _log.warning("页面 %s 数据加载失败: %s", result.page_id, result.error)
+            return
+        if not self._page_load_state.accept(result):
+            return
+        if result.page_id != self._current_page:
+            return
+        if result.page_id in {"config", "user_manage"}:
+            if not self._current_user or self._current_user.get("role") != "admin":
+                return
+        self._apply_page_payload(result.page_id, result.payload)
+
+    def _apply_page_payload(self, page_id: str, payload: dict[str, list[dict]]):
+        """在 GUI 线程将已读取快照交给对应视图。"""
         if page_id == "inventory":
-            materials = self.local_db.query(TABLE_MATERIALS, order_by="last_update DESC")
-            self.inventory_view.set_data(materials)
-
+            self.inventory_view.set_data(payload["materials"])
         elif page_id == "register":
-            materials = self.local_db.query(TABLE_MATERIALS)
-            borrow_records = self.local_db.query(
-                TABLE_BORROW_RECORDS,
-                conditions="is_archived IS NULL OR is_archived = 0",
-                order_by="created_at DESC"
-            )
-            self.register_view.set_materials(materials)
-            self.register_view.set_records(borrow_records)
-
+            self.register_view.set_materials(payload["materials"])
+            self.register_view.set_records(payload["borrow_records"])
         elif page_id == "asset":
-            fixed_assets = self.local_db.query(TABLE_FIXED_ASSETS, order_by="updated_at DESC")
-            self.asset_view.set_data(fixed_assets)
-
+            self.asset_view.set_data(payload["assets"])
         elif page_id == "config":
-            config_items = self.local_db.query(TABLE_CONFIG_ITEMS, order_by="sort_order")
-            self.config_view.set_data(config_items)
-
+            self.config_view.set_data(payload["config_items"])
         elif page_id == "user_manage":
-            users = self.local_db.get_all_users()
-            self.user_manage_view.set_data(users)
+            self.user_manage_view.set_data(payload["users"])
             self.user_manage_view.set_current_user(self._current_user or {})
-            employees = self.local_db.get_all_employees()
-            self.user_manage_view.set_employee_data(employees)
+            self.user_manage_view.set_employee_data(payload["employees"])
+        self.status_bar.showMessage(tr("status.data_refreshed", page=tr(f"nav.{page_id}")))
 
-        page_name = tr(f"nav.{page_id}")
-        self.status_bar.showMessage(tr("status.data_refreshed", page=page_name))
+    def _load_data_for_page(self, page_id: str):
+        """兼容入口：页面读取始终转为异步调度。"""
+        self._request_page_load(page_id)
 
     def _on_page_changed(self, page_id: str):
-        """页面切换事件 — 带权限拦截"""
-        # 权限拦截：非管理员禁止访问系统配置和用户管理
+        """页面切换事件 — 带权限拦截。"""
         admin_only_pages = {"config", "user_manage"}
         if page_id in admin_only_pages:
             is_admin = self._current_user and self._current_user.get("role") == "admin"
@@ -1150,15 +1175,11 @@ class MainWindow(QMainWindow):
                 from widgets.toast import toast_error
                 toast_error(self, tr("toast.no_permission", page=page_name))
                 return
-
         self._current_page = page_id
         self.nav_bar.set_active_page(page_id)
-        page_map = {
-            "inventory": 0, "register": 1, "asset": 2,
-            "config": 3, "user_manage": 4,
-        }
+        page_map = {"inventory": 0, "register": 1, "asset": 2, "config": 3, "user_manage": 4}
         self.stacked_widget.setCurrentIndex(page_map.get(page_id, 0))
-        self._load_data_for_page(page_id)
+        self._request_page_load(page_id)
 
     def _apply_app_mode(self):
         """根据运行模式配置同步引擎和网络监测
@@ -1419,18 +1440,18 @@ class MainWindow(QMainWindow):
         data["updated_at"] = now
         data["last_update"] = now
         self.sync_engine.offline_insert(TABLE_MATERIALS, material_id, data, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("inventory", "register")
 
     def _on_update_material(self, material_id: str, data: dict):
         now = datetime.now().isoformat()
         data["updated_at"] = now
         data["last_update"] = now
         self.sync_engine.offline_update(TABLE_MATERIALS, material_id, data, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("inventory", "register")
 
     def _on_delete_material(self, material_id: str):
         self.sync_engine.offline_delete(TABLE_MATERIALS, material_id, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("inventory", "register")
 
     def _on_import_materials(self, items: list):
         """批量导入物料（v4.2 优化：O(1) 查重）"""
@@ -1480,7 +1501,7 @@ class MainWindow(QMainWindow):
             count += 1
 
         toast_success(self, tr("toast.imported", count=count))
-        self._refresh_current_view()
+        self._refresh_current_view("inventory", "register")
 
     # ---------- 领用/归还操作 ----------
 
@@ -1516,6 +1537,7 @@ class MainWindow(QMainWindow):
                     "stock_qty": new_stock,
                     "updated_at": datetime.now().isoformat(),
                 }, add_to_queue=self._sync_queue_enabled)
+        self._invalidate_page_cache("inventory", "register")
         self._request_refresh()
 
     def _on_return_submit(self, data: dict):
@@ -1565,6 +1587,7 @@ class MainWindow(QMainWindow):
                 }, add_to_queue=self._sync_queue_enabled)
         # 原地更新：直接修改 register_view._records，只重绘受影响的行，不触发整页刷新
         data["is_returned"] = 1
+        self._invalidate_page_cache("inventory", "register")
         self._refresh_return_row(record_id, data)
 
     def _on_damage_status_update(self, record_id: str, new_status: str):
@@ -1577,6 +1600,7 @@ class MainWindow(QMainWindow):
             "updated_at": now,
         }, add_to_queue=self._sync_queue_enabled)
         # 原地更新：只重绘受影响的行
+        self._invalidate_page_cache("register")
         self._refresh_return_row(record_id, {"damage_status": new_status})
 
     def _generate_record_no(self) -> str:
@@ -1594,15 +1618,15 @@ class MainWindow(QMainWindow):
     def _on_add_asset(self, data: dict):
         asset_id = data.get("id")
         self.sync_engine.offline_insert(TABLE_FIXED_ASSETS, asset_id, data, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("asset")
 
     def _on_update_asset(self, asset_id: str, data: dict):
         self.sync_engine.offline_update(TABLE_FIXED_ASSETS, asset_id, data, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("asset")
 
     def _on_delete_asset(self, asset_id: str):
         self.sync_engine.offline_delete(TABLE_FIXED_ASSETS, asset_id, add_to_queue=self._sync_queue_enabled)
-        self._refresh_current_view()
+        self._refresh_current_view("asset")
 
     def _refresh_current_view(self):
         """仅刷新当前视图的数据（避免全量加载所有表）"""
@@ -1660,6 +1684,7 @@ class MainWindow(QMainWindow):
         self._apply_mode_change(self._app_mode, new_mode)
         # 配置保存后重新检查 MySQL 禁用状态（新密码/新host 生效）
         self.mysql_client.recheck_disabled()
+        self._invalidate_page_cache("config")
         self.status_bar.showMessage(tr("status.config_saved"))
 
     # ---------- 用户管理操作 ----------

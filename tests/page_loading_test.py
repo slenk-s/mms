@@ -139,3 +139,26 @@ def test_readonly_connection_rejects_writes(benchmark_database):
     with open_readonly_connection(workshop_db_path) as connection:
         with pytest.raises(sqlite3.OperationalError):
             connection.execute("CREATE TABLE must_not_be_created (id INTEGER)")
+
+def test_newer_request_rejects_older_result():
+    from page_data_loader import PageLoadResult, PageLoadState
+
+    state = PageLoadState()
+    first_request = state.begin_request("inventory")
+    second_request = state.begin_request("inventory")
+
+    assert not state.accept(PageLoadResult("inventory", first_request, {"materials": []}, None))
+    assert state.get_cached("inventory") is None
+    assert state.accept(PageLoadResult("inventory", second_request, {"materials": [{"id": "latest"}]}, None))
+    assert state.get_cached("inventory") == {"materials": [{"id": "latest"}]}
+
+
+def test_cache_invalidation_rejects_inflight_result():
+    from page_data_loader import PageLoadResult, PageLoadState
+
+    state = PageLoadState()
+    request_id = state.begin_request("asset")
+    state.invalidate("asset")
+
+    assert not state.accept(PageLoadResult("asset", request_id, {"assets": []}, None))
+    assert state.get_cached("asset") is None
