@@ -152,3 +152,30 @@ def test_status_confirmations_require_matching_in_progress_batch(local_db: Local
         claimed["operation_id"], claimed["batch_id"], "permanent error"
     )
     assert not local_db.mark_sync_succeeded(claimed["operation_id"], claimed["batch_id"])
+
+
+def test_reopening_local_db_recovers_in_progress_operations(tmp_path: Path):
+    db_path = tmp_path / "reopen.db"
+    first_db = LocalDB(str(db_path), workshop="测试车间")
+    try:
+        enqueue(first_db, "op-reopen")
+        claimed = first_db.claim_sync_batch(now="2026-09-29T10:00:00")
+        assert claimed[0]["status"] == "in_progress"
+    finally:
+        first_db.close_all()
+
+    reopened_db = LocalDB(str(db_path), workshop="测试车间")
+    try:
+        recovered = reopened_db.get_sync_queue_item(claimed[0]["id"])
+        assert recovered["status"] == "retryable"
+        assert recovered["batch_id"] is None
+    finally:
+        reopened_db.close_all()
+
+
+def test_pending_record_ids_exclude_succeeded_operations(local_db: LocalDB):
+    enqueue(local_db, "op-succeeded-id")
+    claimed = local_db.claim_sync_batch(now="2026-09-29T10:00:00")[0]
+
+    assert local_db.mark_sync_succeeded(claimed["operation_id"], claimed["batch_id"])
+    assert local_db.get_pending_record_ids("MMS_Materials") == set()

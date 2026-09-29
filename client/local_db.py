@@ -231,6 +231,7 @@ class LocalDB:
         self._conn_pool: Dict[int, sqlite3.Connection] = {}
         self._pool_lock = threading.Lock()
         self._init_db()
+        self.recover_in_progress_operations()
         self._shared_db_path = os.path.join(os.path.dirname(db_path), "local_cache_common.db")
         self._shared_conn_pool: Dict[int, sqlite3.Connection] = {}
         self._shared_init_db()
@@ -1188,7 +1189,10 @@ class LocalDB:
 
     def get_pending_record_ids(self, table: str) -> set:
         """获取指定表中待同步的记录ID集合（防止云端覆盖本地未上传的修改）"""
-        sql = "SELECT record_id FROM sync_queue WHERE table_name = ?"
+        sql = """
+            SELECT record_id FROM sync_queue
+            WHERE table_name = ? AND (status IS NULL OR status != 'succeeded')
+        """
         with self._connect() as conn:
             cursor = conn.execute(sql, (table,))
             return {row["record_id"] for row in cursor.fetchall()}
