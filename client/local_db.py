@@ -15,6 +15,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple, Set
 from contextlib import contextmanager
@@ -541,14 +542,23 @@ class LocalDB:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sync_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_id TEXT NOT NULL UNIQUE,
                     table_name TEXT NOT NULL,
                     operation TEXT NOT NULL CHECK(operation IN ('INSERT','UPDATE','DELETE')),
                     record_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     retry_count INTEGER DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'in_progress', 'retryable', 'succeeded', 'failed')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    next_retry_at TEXT,
+                    batch_id TEXT,
+                    status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            self._migrate_sync_queue_state_machine(cursor)
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sync_log (
@@ -585,6 +595,7 @@ class LocalDB:
                 f"CREATE INDEX IF NOT EXISTS idx_asset_name ON {_q(TABLE_FIXED_ASSETS)}(asset_name)",
                 f"CREATE INDEX IF NOT EXISTS idx_config_name ON {_q(TABLE_CONFIG_ITEMS)}(config_name)",
                 "CREATE INDEX IF NOT EXISTS idx_sync_queue ON sync_queue(created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_sync_queue_claim ON sync_queue(status, next_retry_at, created_at)",
             ]
             for stmt in index_statements:
                 cursor.execute(stmt)
@@ -595,6 +606,64 @@ class LocalDB:
                 f"UPDATE {_q(TABLE_USERS)} SET password = ? WHERE username = 'admin' AND password = 'admin'",
                 (hash_password("admin"),)
             )
+
+    def _migrate_sync_queue_state_machine(self, cursor):
+        """为旧版 sync_queue 补齐可恢复状态机字段。"""
+        existing_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(sync_queue)")
+        }
+        new_columns = [
+            ("operation_id", "TEXT"),
+            ("status", "TEXT DEFAULT 'pending'"),
+            ("attempt_count", "INTEGER DEFAULT 0"),
+            ("last_error", "TEXT"),
+            ("next_retry_at", "TEXT"),
+            ("batch_id", "TEXT"),
+            ("status_updated_at", "TEXT"),
+        ]
+        for column_name, column_type in new_columns:
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE sync_queue ADD COLUMN {column_name} {column_type}"
+                )
+
+        cursor.execute(
+            """
+            UPDATE sync_queue
+            SET operation_id = 'legacy-' || id
+            WHERE operation_id IS NULL OR operation_id = ''
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE sync_queue
+            SET status = 'pending'
+            WHERE status IS NULL OR status = ''
+            """
+        )
+        if "attempt_count" not in existing_columns:
+            cursor.execute(
+                "UPDATE sync_queue SET attempt_count = COALESCE(retry_count, 0)"
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE sync_queue
+                SET attempt_count = COALESCE(attempt_count, retry_count, 0)
+                WHERE attempt_count IS NULL
+                """
+            )
+        cursor.execute(
+            """
+            UPDATE sync_queue
+            SET status_updated_at = COALESCE(status_updated_at, created_at, CURRENT_TIMESTAMP)
+            WHERE status_updated_at IS NULL OR status_updated_at = ''
+            """
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_queue_operation_id "
+            "ON sync_queue(operation_id)"
+        )
 
     def _migrate_borrow_records_v19(self, cursor):
         """v19 迁移：为已有 borrow_records 表添加归还相关新字段"""
@@ -950,12 +1019,142 @@ class LocalDB:
 
     def add_sync_queue(self, table_name: str, operation: str,
                        record_id: str, payload: Dict) -> None:
+        """兼容旧调用方的入队接口。"""
+        self.enqueue_sync_operation(table_name, operation, record_id, payload)
+
+    def enqueue_sync_operation(self, table_name: str, operation: str,
+                               record_id: str, payload: Dict,
+                               operation_id: Optional[str] = None,
+                               conn: Optional[sqlite3.Connection] = None) -> int:
+        """写入一条 pending 操作；传入 conn 时由调用方控制同一事务。"""
+        operation_id = operation_id or str(uuid.uuid4())
         sql = """
-            INSERT INTO sync_queue (table_name, operation, record_id, payload)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sync_queue (
+                operation_id, table_name, operation, record_id, payload, status,
+                attempt_count, status_updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
         """
+        params = (
+            operation_id, table_name, operation, record_id,
+            json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(),
+        )
+        if conn is not None:
+            return conn.execute(sql, params).lastrowid
+        with self._connect() as own_conn:
+            return own_conn.execute(sql, params).lastrowid
+
+    def claim_sync_batch(self, limit: int = 50, now: Optional[str] = None,
+                         batch_id: Optional[str] = None) -> List[Dict]:
+        """原子领取 pending 或已到期 retryable 操作并标记为 in_progress。"""
+        limit = _validate_numeric(limit, "同步领取数量")
+        if limit == 0:
+            return []
+        now = now or datetime.now().isoformat()
+        batch_id = batch_id or str(uuid.uuid4())
+        eligible = (
+            "(status = 'pending' OR (status = 'retryable' "
+            "AND (next_retry_at IS NULL OR next_retry_at <= ?)))"
+        )
         with self._connect() as conn:
-            conn.execute(sql, (table_name, operation, record_id, json.dumps(payload, ensure_ascii=False)))
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                f"SELECT id FROM sync_queue WHERE {eligible} "
+                "ORDER BY created_at, id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+            if not rows:
+                return []
+            ids = [row["id"] for row in rows]
+            placeholders = ", ".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE sync_queue SET status = 'in_progress', batch_id = ?, "
+                f"status_updated_at = ? WHERE id IN ({placeholders}) AND {eligible}",
+                (batch_id, now, *ids, now),
+            )
+            claimed = conn.execute(
+                f"SELECT * FROM sync_queue WHERE id IN ({placeholders}) "
+                "AND status = 'in_progress' AND batch_id = ? ORDER BY created_at, id",
+                (*ids, batch_id),
+            ).fetchall()
+            return [dict(row) for row in claimed]
+
+    def mark_sync_succeeded(self, operation_id: str, batch_id: str) -> bool:
+        """仅确认属于当前领取批次的 in_progress 操作。"""
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE sync_queue
+                SET status = 'succeeded', batch_id = NULL, last_error = NULL,
+                    next_retry_at = NULL, status_updated_at = ?
+                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
+                """,
+                (now, operation_id, batch_id),
+            )
+            return result.rowcount == 1
+
+    def mark_sync_retryable(self, operation_id: str, batch_id: str, error: str,
+                            next_retry_at: Optional[str] = None,
+                            max_attempts: int = 3) -> bool:
+        """记录可重试失败；达到上限时将操作标记为 failed。"""
+        max_attempts = _validate_numeric(max_attempts, "最大重试次数")
+        if max_attempts == 0:
+            raise ValueError("最大重试次数必须至少为 1")
+        now = datetime.now().isoformat()
+        retry_at = next_retry_at or now
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE sync_queue
+                SET attempt_count = attempt_count + 1,
+                    last_error = ?,
+                    status = CASE WHEN attempt_count + 1 >= ?
+                                  THEN 'failed' ELSE 'retryable' END,
+                    next_retry_at = CASE WHEN attempt_count + 1 >= ?
+                                         THEN NULL ELSE ? END,
+                    batch_id = NULL,
+                    status_updated_at = ?
+                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
+                """,
+                (error, max_attempts, max_attempts, retry_at, now, operation_id, batch_id),
+            )
+            if result.rowcount != 1:
+                return False
+            row = conn.execute(
+                "SELECT status FROM sync_queue WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            return row["status"] == "retryable"
+
+    def mark_sync_failed(self, operation_id: str, batch_id: str, error: str) -> bool:
+        """将当前批次中的 in_progress 操作条件更新为 failed。"""
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE sync_queue
+                SET status = 'failed', batch_id = NULL, last_error = ?,
+                    next_retry_at = NULL, status_updated_at = ?
+                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
+                """,
+                (error, now, operation_id, batch_id),
+            )
+            return result.rowcount == 1
+
+    def recover_in_progress_operations(self, now: Optional[str] = None) -> int:
+        """启动恢复时把遗留 in_progress 操作重新置为可领取状态。"""
+        now = now or datetime.now().isoformat()
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE sync_queue
+                SET status = 'retryable', batch_id = NULL, next_retry_at = ?,
+                    status_updated_at = ?
+                WHERE status = 'in_progress'
+                """,
+                (now, now),
+            )
+            return result.rowcount
 
     def get_sync_queue(self, limit: int = 50) -> List[Dict]:
         sql = "SELECT * FROM sync_queue ORDER BY created_at LIMIT ?"
