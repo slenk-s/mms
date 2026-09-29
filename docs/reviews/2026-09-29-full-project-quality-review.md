@@ -15,11 +15,11 @@
 | 检查 | 结果 | 证据 |
 | --- | --- | --- |
 | Python 源码语法编译 | 通过 | 使用 Codex 随附 Python 3.12 执行 `python -m compileall -q client`，退出码 0。 |
-| pytest | 未执行 | 系统 Python 3.11 的可执行文件缺失；随附 Python 无 `pytest` 与 `PySide6`。 |
-| flake8 | 未执行 | 当前环境未安装 `flake8` 命令。 |
+| pytest | 失败：未收集测试 | 在本地隔离 `.venv`（Python 3.12）运行 CI 等价 pytest 命令，收集 0 项并以退出码 5 结束。 |
+| flake8 阻塞规则 | 失败：6 个 F821 | `client/utils/updater.py` 有 5 处未定义 `_log`；`client/views/config_view.py:2014` 有 1 处未定义 `toast_warning`。 |
 | CI 测试发现 | 无有效 Python 用例 | `tests/` 仅包含 `test_update_chain.js`、`test_update.py`、`upload_update.py`；CI 排除了两个 Python 文件，且未执行 Node 测试。 |
 
-本地环境缺少可用的 Python 3.11 与开发依赖，不代表 CI 必然失败；但仓库没有锁定依赖或一键初始化脚本，使本地复现 CI 的成本和不确定性较高。
+系统 Python 3.11 的注册路径指向不存在的解释器。为获得实际 pytest/flake8 输出，本次建立了被 `.gitignore` 排除的本地 Python 3.12 `.venv`；该环境不能替代 CI 的 Python 3.11，但已足以确认测试发现为空和 flake8 的静态未定义名称错误。
 
 ## 发现
 
@@ -53,6 +53,15 @@
 - **验证方式：** 使用注入的读取器或计数器断言首次登录仅发起一次库存页面加载。
 - **本轮归属：** 本轮页面加载优化。
 
+### [P2] 更新校验与配置保存的错误分支包含未定义名称
+
+- **位置：** `client/utils/updater.py:192,197,200,204,207`、`client/views/config_view.py:2014`。
+- **触发条件：** 更新包过小、ZIP 为空/CRC 异常/损坏，或保存 MySQL 配置时凭据仅能写入 fallback 加密文件。
+- **影响：** `_verify_zip()` 的预期错误处理会调用未定义的 `_log`，将原本可诊断的更新校验失败升级为 `NameError`；配置保存已成功但进入 fallback 提示分支时，未定义的 `toast_warning` 触发异常并可能向用户显示“保存失败”的误导提示。
+- **证据：** 本地 CI 等价 flake8 命令报告上述 6 个 `F821 undefined name`；模块顶部定义的是 `_LOG = logging.getLogger(__name__)`，而错误路径使用 `_log`；`config_view.py` 的导入中不存在 `toast_warning`。
+- **建议：** 将 `updater.py` 的 5 处 `_log` 统一为 `_LOG`；从 `widgets.toast` 显式导入 `toast_warning`，并为两个错误/降级分支补充单元测试。
+- **验证方式：** 修复后 CI 阻塞级 flake8 为 0；构造空 ZIP/损坏 ZIP 与凭据 fallback，分别断言返回受控失败结果和显示警告而非抛出 `NameError`。
+- **本轮归属：** 质量修复专项；在页面性能改动合并前应一并修复，以恢复基本 CI 闸门。
 ### [P2] CI 对核心测试与 Cython 构建缺少失败保护
 
 - **位置：** `.github/workflows/ci.yml:67-69,76-78`、`tests/`。
@@ -96,7 +105,7 @@
 ## 优先级与处理顺序
 
 1. **立即安排：** P1 Web API Key 认证失效；在服务对非受信网络开放前必须修复或限制网络暴露。
-2. **本轮执行：** P2 页面同步加载、首次库存重复加载、页面加载测试与 5,000 条压测。
+2. **本轮执行：** P2 更新/配置错误分支的未定义名称、页面同步加载、首次库存重复加载、页面加载测试与 5,000 条压测。
 3. **下一轮：** P2 CI 测试保护、Cython 构建可见性、线程协作式关闭、Web 异常脱敏。
 4. **持续治理：** P3 按职责拆分超大模块并降低广泛 `except Exception` 的可观测性缺口。
 
