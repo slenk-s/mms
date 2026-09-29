@@ -6,7 +6,9 @@ import time
 from typing import List, Dict, Optional, Any, Callable
 import pymysql
 from pymysql.cursors import DictCursor
-from pymysql.err import ProgrammingError, OperationalError
+from pymysql.err import (
+    DataError, IntegrityError, InternalError, OperationalError, ProgrammingError,
+)
 
 import config as _cfg
 from .credential_manager import get_password as _get_db_pw_tuple, _get_password_raw as _get_db_pw
@@ -69,8 +71,15 @@ _RECURSION_LIMIT = 3
 
 from config import (
     TABLE_MATERIALS, TABLE_BORROW_RECORDS, TABLE_FIXED_ASSETS,
+    TABLE_CONFIG_ITEMS, TABLE_USERS, TABLE_EMPLOYEE_RECORDS,
 )
 WORKSHOP_TABLES = {TABLE_MATERIALS, TABLE_BORROW_RECORDS, TABLE_FIXED_ASSETS}
+SYNC_TABLES = WORKSHOP_TABLES | {
+    TABLE_CONFIG_ITEMS, TABLE_USERS, TABLE_EMPLOYEE_RECORDS,
+}
+SYNC_OPERATION_LOG_TABLE = "MMS_SyncOperationLog"
+RETRYABLE_MYSQL_CODES = {1040, 1205, 1213, 2002, 2003, 2006, 2013}
+FAILED_MYSQL_OPERATIONAL_CODES = {1044, 1045, 1049, 1142, 1143, 1227}
 
 
 class MySQLClient:
@@ -447,6 +456,141 @@ class MySQLClient:
         except Exception as e:
             _log.warning("MySQL upsert 未预期异常: %s", e)
             raise
+
+    def apply_sync_operation(self, operation_id: str, table_name: str,
+                             operation: str, record_id: str, payload: Dict) -> str:
+        """原子应用一条同步操作，并以 ``operation_id`` 保证幂等。
+
+        业务写入与 ``MMS_SyncOperationLog`` 的成功日志处于同一个 MySQL
+        事务。日志主键冲突表示此前已经提交过该操作，因此不会再次执行
+        业务写入。返回值固定为 ``applied``、``already_applied``、
+        ``retryable_error`` 或 ``failed_error``。
+        """
+        try:
+            self._validate_sync_operation(
+                operation_id, table_name, operation, record_id, payload
+            )
+        except (TypeError, ValueError) as e:
+            _log.warning("同步操作校验失败: %s", e)
+            return "failed_error"
+
+        self._ensure_conn()
+        if not self._conn:
+            return "retryable_error"
+
+        try:
+            self._conn.begin()
+            with self._conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "INSERT INTO `%s` "
+                        "(`operation_id`, `table_name`, `operation`, `record_id`, "
+                        "`processed_at`, `result`) VALUES (%%s, %%s, %%s, %%s, NOW(), %%s)" %
+                        SYNC_OPERATION_LOG_TABLE,
+                        (operation_id, table_name, operation, record_id, "applied"),
+                    )
+                except IntegrityError as e:
+                    if getattr(e, "args", (None,))[0] == 1062:
+                        self._conn.rollback()
+                        return "already_applied"
+                    raise
+
+                self._execute_sync_business_write(
+                    cur, table_name, operation, record_id, payload
+                )
+            self._conn.commit()
+            return "applied"
+        except OperationalError as e:
+            self._rollback_sync_transaction()
+            code = getattr(e, "args", (None,))[0]
+            if code in FAILED_MYSQL_OPERATIONAL_CODES:
+                _log.warning("同步操作权限或配置错误，不可自动处理 (%s): %s", code, e)
+                return "failed_error"
+            _log.warning("同步操作暂时失败，将重试 (%s): %s", code, e)
+            self._close_conn()
+            return "retryable_error"
+        except (OSError, TimeoutError, ConnectionError) as e:
+            self._rollback_sync_transaction()
+            _log.warning("同步操作暂时失败，将重试: %s", e)
+            self._close_conn()
+            return "retryable_error"
+        except (ProgrammingError, DataError, IntegrityError, InternalError, ValueError) as e:
+            self._rollback_sync_transaction()
+            _log.warning("同步操作不可自动处理: %s", e)
+            return "failed_error"
+        except pymysql.err.Error as e:
+            self._rollback_sync_transaction()
+            code = getattr(e, "args", (None,))[0]
+            if code in RETRYABLE_MYSQL_CODES:
+                _log.warning("同步操作 MySQL 暂时失败 (%s): %s", code, e)
+                self._close_conn()
+                return "retryable_error"
+            _log.warning("同步操作 MySQL 不可自动处理 (%s): %s", code, e)
+            return "failed_error"
+        except Exception as e:
+            self._rollback_sync_transaction()
+            _log.exception("同步操作未预期异常: %s", e)
+            return "failed_error"
+
+    @staticmethod
+    def _validate_sync_operation(operation_id: str, table_name: str,
+                                 operation: str, record_id: str, payload: Dict):
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id 不能为空")
+        if table_name not in SYNC_TABLES:
+            raise ValueError("不允许同步的表: %s" % table_name)
+        if operation not in {"INSERT", "UPDATE", "DELETE"}:
+            raise ValueError("不支持的同步操作: %s" % operation)
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError("record_id 不能为空")
+        if not isinstance(payload, dict):
+            raise ValueError("payload 必须是字典")
+        if "id" in payload and str(payload["id"]) != record_id:
+            raise ValueError("payload.id 与 record_id 不一致")
+        for column in payload:
+            if not isinstance(column, str) or not _MYSQL_COL_RE.match(column):
+                raise ValueError("不安全的 MySQL 列名: %s" % column)
+
+    def _execute_sync_business_write(self, cur, table_name: str, operation: str,
+                                     record_id: str, payload: Dict):
+        """执行严格业务写入；不将 INSERT/UPDATE 自动转换为另一种操作。"""
+        if operation == "INSERT":
+            data = dict(payload)
+            data.setdefault("id", record_id)
+            columns = ", ".join("`%s`" % column for column in data)
+            placeholders = ", ".join(["%s"] * len(data))
+            cur.execute(
+                "INSERT INTO `%s` (%s) VALUES (%s)" %
+                (table_name, columns, placeholders),
+                tuple(data.values()),
+            )
+            return
+
+        where = "`id` = %s"
+        where, params = self._workshop_clause(table_name, where, (record_id,))
+        if operation == "UPDATE":
+            if not payload:
+                raise ValueError("UPDATE payload 不能为空")
+            cur.execute(
+                "SELECT 1 FROM `%s` WHERE %s LIMIT 1" % (table_name, where),
+                params,
+            )
+            if cur.fetchone() is None:
+                raise ValueError("UPDATE 目标记录不存在，不能自动合并")
+            sets = ", ".join("`%s` = %%s" % column for column in payload)
+            cur.execute(
+                "UPDATE `%s` SET %s WHERE %s" % (table_name, sets, where),
+                tuple(payload.values()) + params,
+            )
+            return
+
+        cur.execute("DELETE FROM `%s` WHERE %s" % (table_name, where), params)
+
+    def _rollback_sync_transaction(self):
+        try:
+            self._conn.rollback()
+        except Exception as e:
+            _log.debug("回滚同步事务失败（已忽略）: %s", e)
 
     def _get_table_columns(self, table: str):
         try:

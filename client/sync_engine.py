@@ -5,9 +5,10 @@
 """
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Callable
 from PySide6.QtCore import QObject, Signal, QTimer, QThread, Slot
+from pymysql.err import OperationalError as MySQLOperationalError
 
 from config import (
     SYNC_INTERVAL_SECONDS, SYNC_RETRY_MAX, SYNC_BATCH_SIZE,
@@ -18,6 +19,73 @@ from config import (
 from logger import get_logger
 
 _log = get_logger(__name__)
+
+SYNC_APPLIED = "applied"
+SYNC_ALREADY_APPLIED = "already_applied"
+SYNC_RETRYABLE_ERROR = "retryable_error"
+SYNC_FAILED_ERROR = "failed_error"
+SYNC_RETRY_BACKOFF_BASE_SECONDS = 5
+SYNC_RETRY_BACKOFF_MAX_SECONDS = 300
+
+
+def _as_datetime(value):
+    if value is None:
+        return datetime.now()
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value)
+
+
+def _next_retry_at(item: Dict, now) -> str:
+    """基于已记录的失败次数计算有上限的指数退避时间。"""
+    attempts = max(int(item.get("attempt_count") or 0), 0)
+    delay = min(
+        SYNC_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempts),
+        SYNC_RETRY_BACKOFF_MAX_SECONDS,
+    )
+    return (_as_datetime(now) + timedelta(seconds=delay)).isoformat()
+
+
+def confirm_sync_results(local_db, results: list, now=None) -> Dict[str, int]:
+    """在主线程确认已领取的同步结果，不删除队列操作记录。"""
+    summary = {"succeeded": 0, "retryable": 0, "failed": 0}
+    for result in results or []:
+        item = result.get("item", {})
+        operation_id = item.get("operation_id")
+        batch_id = item.get("batch_id")
+        outcome = result.get("outcome")
+        error = result.get("error") or outcome or "未知同步错误"
+        if not operation_id or not batch_id:
+            _log.error("忽略缺少 operation_id 或 batch_id 的同步结果: %r", result)
+            continue
+
+        if outcome in {SYNC_APPLIED, SYNC_ALREADY_APPLIED}:
+            if local_db.mark_sync_succeeded(operation_id, batch_id):
+                if item.get("operation") == "DELETE":
+                    local_db.delete_snapshot(item["table_name"], item["record_id"])
+                else:
+                    try:
+                        local_db.save_snapshot(
+                            item["table_name"], item["record_id"],
+                            json.loads(item["payload"]),
+                        )
+                    except (KeyError, TypeError, json.JSONDecodeError) as e:
+                        _log.warning("同步成功但快照保存失败: %s", e)
+                summary["succeeded"] += 1
+            continue
+
+        if outcome == SYNC_RETRYABLE_ERROR:
+            retry_at = _next_retry_at(item, now)
+            retryable = local_db.mark_sync_retryable(
+                operation_id, batch_id, error, next_retry_at=retry_at,
+                max_attempts=SYNC_RETRY_MAX,
+            )
+            summary["retryable" if retryable else "failed"] += 1
+            continue
+
+        local_db.mark_sync_failed(operation_id, batch_id, error)
+        summary["failed"] += 1
+    return summary
 
 
 class SyncWorker(QObject):
@@ -69,28 +137,12 @@ class SyncWorker(QObject):
     def push_items(self, queue_items: list):
         """推送队列项到云端(MySQL)"""
         self._ensure_init()
-        results = []
-        total = 0
-        error_msg = ""
-        try:
-            for item in queue_items:
-                success, conflict_info = self._process_item(item)
-                # 冲突时视为已处理（云端版本优先），同时传回冲突信息
-                if conflict_info is not None:
-                    success = True
-                results.append((
-                    item["id"], success, conflict_info,
-                    "" if success else "网络异常"
-                ))
-                if success:
-                    total += 1
-        except (RuntimeError, OSError, ValueError, KeyError, json.JSONDecodeError) as e:
-            error_msg = str(e)
-            _log.error("推送批量失败: %s", e)
-        except Exception as e:
-            error_msg = str(e)
-            _log.error("推送批量未预期异常: %s", e)
-        self.push_result.emit(results, total, error_msg)
+        results = [self._process_item(item) for item in queue_items]
+        total = sum(
+            result["outcome"] in {SYNC_APPLIED, SYNC_ALREADY_APPLIED}
+            for result in results
+        )
+        self.push_result.emit(results, total, "")
 
     @Slot(str, str, str)
     def pull_table(self, table: str, last_sync: str, workshop: str):
@@ -129,78 +181,32 @@ class SyncWorker(QObject):
 
     # ---------- 内部处理 ----------
 
-    def _process_item(self, item: Dict) -> tuple:
-        """处理单条同步队列项
-
-        返回: (success: bool, conflict_info: dict or None)
-        """
-        table = item["table_name"]
-        operation = item["operation"]
-        record_id = item["record_id"]
-        payload = json.loads(item["payload"])
+    def _process_item(self, item: Dict) -> Dict:
+        """将一条已领取队列项交给 MySQL 幂等事务接口处理。"""
         try:
-            if operation == "INSERT":
-                existing = self._mysql.fetch_by_id(table, record_id)
-                if existing is None and self._mysql.is_connected():
-                    _log.debug("表 %s 记录 %s 不存在，尝试插入", table, record_id)
-                    pass
-                if existing:
-                    conflict = self._check_conflict(table, record_id, existing, payload)
-                    if conflict:
-                        return True, conflict
-                    result = self._mysql.update(table, record_id, payload)
-                    if result is None:
-                        _log.warning("INSERT 转为 UPDATE 失败: %s/%s", table, record_id)
-                        return False, None
-                else:
-                    # 业务唯一字段查重（如 asset_no / material_code）
-                    biz_key, biz_col = self._get_biz_unique_key(table, payload)
-                    if biz_key and biz_col:
-                        dup = self._mysql.fetch_by_condition(table, biz_col, biz_key)
-                        if dup:
-                            dup_id = dup[0].get("id", record_id)
-                            conflict = self._check_conflict(table, dup_id, dup[0], payload)
-                            if conflict:
-                                return True, conflict
-                            result = self._mysql.update(table, dup_id, payload)
-                            if result is None:
-                                _log.warning("业务键查重后 UPDATE 失败: %s/%s", table, record_id)
-                                return False, None
-                            return True, None
-                    result = self._mysql.insert(table, payload)
-                    if result is None:
-                        _log.warning("INSERT 失败: %s/%s", table, record_id)
-                        return False, None
-            elif operation == "UPDATE":
-                existing = self._mysql.fetch_by_id(table, record_id)
-                if existing is None and self._mysql.is_connected():
-                    _log.debug("表 %s 记录 %s 在 MySQL 不存在，跳过 UPDATE", table, record_id)
-                    return True, None
-                if existing:
-                    conflict = self._check_conflict(table, record_id, existing, payload)
-                    if conflict:
-                        return True, conflict
-                    result = self._mysql.update(table, record_id, payload)
-                    if result is None:
-                        _log.warning("UPDATE 失败: %s/%s", table, record_id)
-                        return False, None
-                else:
-                    result = self._mysql.insert(table, payload)
-                    if result is None:
-                        _log.warning("UPDATE 转为 INSERT 失败: %s/%s", table, record_id)
-                        return False, None
-            elif operation == "DELETE":
-                result = self._mysql.delete(table, record_id)
-                if not result:
-                    _log.warning("DELETE 失败: %s/%s", table, record_id)
-                    return False, None
-            return True, None
-        except (RuntimeError, OSError, ValueError, KeyError, json.JSONDecodeError) as e:
-            _log.warning("同步处理失败: %s/%s/%s — %s", table, operation, record_id, e, exc_info=True)
-            return False, None
+            payload = json.loads(item["payload"])
+            outcome = self._mysql.apply_sync_operation(
+                item["operation_id"], item["table_name"], item["operation"],
+                item["record_id"], payload,
+            )
+            if outcome not in {
+                SYNC_APPLIED, SYNC_ALREADY_APPLIED,
+                SYNC_RETRYABLE_ERROR, SYNC_FAILED_ERROR,
+            }:
+                outcome = SYNC_FAILED_ERROR
+                error = "MySQL 返回了未知同步结果"
+            else:
+                error = "" if outcome in {SYNC_APPLIED, SYNC_ALREADY_APPLIED} else outcome
+            return {"item": item, "outcome": outcome, "error": error}
+        except (MySQLOperationalError, OSError, TimeoutError, ConnectionError) as e:
+            _log.warning("同步操作连接暂时失败: %s", e)
+            return {"item": item, "outcome": SYNC_RETRYABLE_ERROR, "error": str(e)}
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            _log.warning("同步操作不可自动处理: %s", e)
+            return {"item": item, "outcome": SYNC_FAILED_ERROR, "error": str(e)}
         except Exception as e:
-            _log.warning("同步处理未预期异常: %s/%s/%s — %s", table, operation, record_id, e, exc_info=True)
-            return False, None
+            _log.exception("同步操作未预期异常: %s", e)
+            return {"item": item, "outcome": SYNC_FAILED_ERROR, "error": str(e)}
 
     @staticmethod
     def _get_biz_unique_key(table: str, payload: Dict) -> tuple:
@@ -335,6 +341,9 @@ class SyncEngine(QObject):
         if self._is_running:
             return
         self._is_running = True
+        recovered = self.local_db.recover_in_progress_operations()
+        if recovered:
+            _log.info("恢复 %d 条中断的同步操作", recovered)
         if self._timer is None:
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._sync_cycle)
@@ -414,8 +423,8 @@ class SyncEngine(QObject):
             self._set_status(self.STATUS_OFFLINE)
             return
         self._set_status(self.STATUS_SYNCING)
-        # 先推送
-        queue = self.local_db.get_sync_queue(SYNC_BATCH_SIZE)
+        # 先原子领取待同步队列；只确认当前批次中的 in_progress 项。
+        queue = self.local_db.claim_sync_batch(SYNC_BATCH_SIZE)
         if queue:
             self.sync_started.emit("push")
             self._request_push.emit(queue)
@@ -472,87 +481,24 @@ class SyncEngine(QObject):
             self._request_pull.emit(table, last_sync, self._workshop)
 
     def _on_worker_push_result(self, results: list, total: int, error: str):
-        """Worker 推送完成回调 — Qt Slot，运行在主线程"""
+        """确认 MySQL 幂等推送的结果，并调度下一阶段拉取。"""
         self._assert_main_thread()
-        # 防御：确保 results 为 list，total 为 int，避免 None 等异常值
-        if results is None:
-            results = []
-        elif not isinstance(results, list):
+        if not isinstance(results, list):
             _log.warning("push_result 收到非 list results: %r", type(results))
             results = []
-        if not isinstance(total, int):
-            try:
-                total = int(total) if total is not None else 0
-            except (TypeError, ValueError):
-                total = 0
-
+        summary = confirm_sync_results(self.local_db, results)
         if error:
             self.sync_failed.emit("push", error)
             self.local_db.add_sync_log("push", "failed", 0, error)
+        elif summary["failed"] or summary["retryable"]:
+            detail = "失败 %d 条，可重试 %d 条" % (
+                summary["failed"], summary["retryable"],
+            )
+            self.local_db.add_sync_log("push", "partial", summary["succeeded"], detail)
+        elif summary["succeeded"]:
+            self.local_db.add_sync_log("push", "success", summary["succeeded"])
 
-        conflicts = []
-        for queue_id, success, conflict_info, _ in results:
-            if conflict_info is not None:
-                # 冲突：记录冲突信息，稍后三路合并处理
-                conflicts.append(conflict_info)
-                self.local_db.remove_sync_queue(queue_id)
-            elif success:
-                # 推送成功：保存快照作为下次三路合并的基线
-                item = self.local_db.get_sync_queue_item(queue_id)
-                if item:
-                    payload = json.loads(item["payload"])
-                    self.local_db.save_snapshot(item["table_name"], item["record_id"], payload)
-                self.local_db.remove_sync_queue(queue_id)
-            else:
-                self.local_db.increment_retry(queue_id)
-                updated = self.local_db.get_sync_queue_item(queue_id)
-                current_retry = updated["retry_count"] if updated else 999
-                if current_retry >= SYNC_RETRY_MAX:
-                    _log.warning("推送记录重试超限，已丢弃: %s/%s (重试 %d 次)",
-                                 updated.get("table_name", "?"), updated.get("record_id", "?"), current_retry)
-                    self.local_db.remove_sync_queue(queue_id)
-                    self.local_db.add_sync_log("push", "failed", 0,
-                                               f"记录重试超限: {updated.get('table_name', '?')}/{updated.get('record_id', '?')}")
-
-        # 三路合并处理冲突：有基线的可自动合并，无基线或真正冲突时云端优先
-        conflict_tables = set()
-        for conflict in conflicts:
-            table = conflict["table"]
-            record_id = conflict["record_id"]
-            cloud_record = conflict["cloud"]
-            local_payload = conflict["local"]
-
-            base = self.local_db.get_snapshot(table, record_id)
-            if base:
-                result = self._three_way_merge(base, local_payload, cloud_record)
-                if result["action"] == "merge":
-                    # 自动合并：本地和云端改了不同字段，合并后写入本地
-                    merged = self._convert_record(result["merged"])
-                    self.local_db.update(table, record_id, merged)
-                    self.local_db.save_snapshot(table, record_id, merged)
-                    _log.info("三路合并自动合并: %s/%s", table, record_id)
-                    continue
-                elif result["action"] == "noop":
-                    # 三方一致，仅更新快照时间戳
-                    self.local_db.save_snapshot(table, record_id, self._convert_record(cloud_record))
-                    continue
-                # conflict: 真正冲突（同一字段两边都变了），云端优先
-                _log.info("检测到真正冲突，云端版本优先: %s/%s 冲突字段: %s",
-                          table, record_id, result.get("fields", []))
-
-            # 无基线或真正冲突 → 云端版本优先，更新快照
-            conflict_tables.add(table)
-            self.local_db.update(table, record_id, self._convert_record(cloud_record))
-            self.local_db.save_snapshot(table, record_id, self._convert_record(cloud_record))
-
-        # 发送冲突通知（主窗口在状态栏显示提示）
-        if conflict_tables:
-            self.batch_conflict_detected.emit({"tables": list(conflict_tables)})
-
-        if total > 0 and not error:
-            self.local_db.add_sync_log("push", "success", total)
-
-        # 推送完继续拉取
+        self.queue_updated.emit(self.local_db.get_sync_queue_count())
         self._start_pull()
 
     def _on_worker_pull_result(self, table: str, records: list, error: str):
