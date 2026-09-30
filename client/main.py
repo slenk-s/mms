@@ -1867,6 +1867,11 @@ class MainWindow(QMainWindow):
         self._apply_app_mode()
 
     def closeEvent(self, event):
+        # 版本检查 QThread 不属于 QWidget 父子树，必须在析构状态栏前收敛。
+        if not self.sync_status_bar.shutdown_for_application_exit():
+            _log.error("版本检查线程未在关闭预算内退出，取消关闭窗口")
+            event.ignore()
+            return
         # 配置页的状态线程必须先结束，随后才能销毁子控件和 LocalDB。
         if not self.config_view.shutdown_for_application_exit():
             _log.error("配置页状态线程未在关闭预算内退出，取消关闭窗口")

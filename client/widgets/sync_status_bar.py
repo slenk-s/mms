@@ -33,11 +33,66 @@ class _VersionCheckThread(QThread):
         super().__init__()
         self.config = config
 
+    def _connect_version_check(self):
+        """用短连接预算执行版本检查，并在每个网络步骤间响应取消。"""
+        import io
+        from utils.updater import _close_ftp, _resolve_ip
+
+        host = _resolve_ip(
+            self.config["host"], self.config.get("port", 21)
+        )
+        port = self.config.get("port", 21)
+        user = self.config["user"]
+        password = self.config["pass"]
+        directory = self.config.get("directory", "/")
+        modes = (("plain", True), ("plain", False),
+                 ("tls", True), ("tls", False))
+        for protocol, passive in modes:
+            if self.isInterruptionRequested():
+                return None, None, "cancelled"
+            ftp = ftplib.FTP_TLS() if protocol == "tls" else ftplib.FTP()
+            keep_connection = False
+            try:
+                # FTP 版本检查不是关键路径：每种协议只尝试一次，连接预算为 1 秒。
+                ftp.connect(host, port, timeout=1)
+                if self.isInterruptionRequested():
+                    return None, None, "cancelled"
+                if protocol == "tls":
+                    ftp.auth()
+                ftp.login(user, password)
+                if protocol == "tls":
+                    ftp.prot_p()
+                if self.isInterruptionRequested():
+                    return None, None, "cancelled"
+                ftp.set_pasv(passive)
+                ftp.cwd(directory)
+                ftp.voidcmd("TYPE I")
+                if self.isInterruptionRequested():
+                    return None, None, "cancelled"
+                version_data = io.BytesIO()
+                ftp.retrbinary("RETR version.txt", version_data.write)
+                if self.isInterruptionRequested():
+                    return None, None, "cancelled"
+                keep_connection = True
+                return ftp, version_data.getvalue(), "OK"
+            except ftplib.error_perm:
+                # 已连接但没有版本文件，保持原有的 no-files 语义。
+                return None, None, "NO_FILES"
+            except Exception:
+                if self.isInterruptionRequested():
+                    return None, None, "cancelled"
+            finally:
+                if not keep_connection:
+                    _close_ftp(ftp)
+        return None, None, None
+
     def run(self):
         import datetime
         import sys
         import traceback
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vchk.log")
+        log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "_vchk.log"
+        )
         log_path = os.path.normpath(log_path)
 
         def _dbg(msg):
@@ -52,14 +107,20 @@ class _VersionCheckThread(QThread):
             _dbg(f"frozen={getattr(sys, 'frozen', False)}")
             _dbg(f"config keys={list(self.config.keys())}")
             _dbg(f"config host={self.config.get('host')}")
+            if self.isInterruptionRequested():
+                return
 
-            from utils.updater import get_local_version, _connect_ftp, _close_ftp, _get_project_root
+            from utils.updater import get_local_version, _close_ftp
             local_ver = get_local_version()
             _dbg(f"local_ver={local_ver}")
-
-            ftp, ver_data, status = _connect_ftp(self.config)
-            _dbg(f"connect ftp={'ok' if ftp else 'None'} ver_data_len={len(ver_data) if ver_data else 0}")
-
+            ftp, ver_data, status = self._connect_version_check()
+            _dbg(
+                f"connect ftp={'ok' if ftp else 'None'} "
+                f"ver_data_len={len(ver_data) if ver_data else 0}"
+            )
+            if self.isInterruptionRequested():
+                _close_ftp(ftp)
+                return
             if ftp is None:
                 _dbg("connect_fail")
                 self.signal_finished.emit({"status": "connect_fail"})
@@ -70,12 +131,14 @@ class _VersionCheckThread(QThread):
             except Exception as e:
                 _dbg(f"invalid_version: {e}")
                 _close_ftp(ftp)
-                self.signal_finished.emit({"status": "invalid_version"})
+                if not self.isInterruptionRequested():
+                    self.signal_finished.emit({"status": "invalid_version"})
                 return
 
             _close_ftp(ftp)
+            if self.isInterruptionRequested():
+                return
             _dbg(f"remote={remote_ver} local={local_ver}")
-
             if remote_ver > local_ver:
                 _dbg("EMIT new_version")
                 self.signal_finished.emit({
@@ -89,7 +152,8 @@ class _VersionCheckThread(QThread):
         except Exception as e:
             _dbg(f"EXCEPTION: {type(e).__name__}: {e}")
             _dbg(traceback.format_exc())
-            self.signal_finished.emit({"status": "latest"})
+            if not self.isInterruptionRequested():
+                self.signal_finished.emit({"status": "latest"})
 
 
 class _ManualUpdateThread(QThread):
@@ -486,6 +550,21 @@ class SyncStatusBar(QWidget):
     def set_update_available(self, available: bool, remote_ver: int = 0):
         self._update_available = available
         self.update_available_changed.emit(available, remote_ver)
+
+    def shutdown_for_application_exit(self, timeout_ms: int = 5000) -> bool:
+        """停止版本检查线程，避免状态栏析构时销毁仍在运行的 QThread。"""
+        thread = self._version_check_thread
+        if thread is None:
+            return True
+        try:
+            thread.requestInterruption()
+            if thread.isRunning() and not thread.wait(max(timeout_ms, 0)):
+                return False
+        except RuntimeError:
+            # Qt 对象已销毁时，不再持有该失效引用。
+            pass
+        self._version_check_thread = None
+        return True
 
     def check_version_on_startup(self):
         from utils.ftp_config import load_update_config

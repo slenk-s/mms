@@ -459,6 +459,7 @@ def _main_window_close_stub(shutdown_result):
     stub = Stub()
     stub.sync_engine = _CloseComponent()
     stub.network_monitor = _CloseComponent()
+    stub.sync_status_bar = _CloseConfig(True)
     stub._refresh_timer = _CloseComponent()
     stub.inventory_view = _CloseComponent()
     stub.register_view = _CloseComponent()
@@ -480,6 +481,7 @@ def test_main_window_close_waits_for_config_thread_shutdown(monkeypatch):
 
     MainWindow.closeEvent(window, event)
 
+    assert window.sync_status_bar.shutdown_calls == 1
     assert window.config_view.shutdown_calls == 1
     assert event.accepted is True
     assert window.local_db.closed is True
@@ -495,6 +497,7 @@ def test_main_window_close_aborts_when_config_threads_are_still_running(monkeypa
 
     MainWindow.closeEvent(window, event)
 
+    assert window.sync_status_bar.shutdown_calls == 1
     assert window.config_view.shutdown_calls == 1
     assert event.ignored is True
     assert window.local_db.closed is False
@@ -535,6 +538,86 @@ def test_main_window_closes_visible_config_view_without_qthread_crash():
 
     assert result.returncode == 0, result.stderr
     assert "QThread: Destroyed while thread is still running" not in result.stderr
+
+
+def test_auto_login_shutdown_waits_for_version_check_thread():
+    """自动登录版本检查线程必须在关闭前停止。"""
+    script = textwrap.dedent(
+        """
+        from PySide6.QtCore import QThread, Signal
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+        from widgets import sync_status_bar
+        from utils import ftp_config
+
+        class InterruptibleVersionCheckThread(QThread):
+            signal_finished = Signal(dict)
+
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+
+            def run(self):
+                while not self.isInterruptionRequested():
+                    self.msleep(10)
+
+        sync_status_bar._VersionCheckThread = InterruptibleVersionCheckThread
+        ftp_config.load_update_config = lambda: {
+            "host": "version-check.test",
+            "port": 21,
+            "user": "test",
+            "pass": "test",
+            "directory": "/",
+        }
+
+        from main import MainWindow
+
+        auto_login_calls = []
+
+        def force_auto_login(self):
+            auto_login_calls.append(True)
+            self._current_user = {
+                "username": "auto-login-test",
+                "role": "admin",
+                "display_name": "auto-login-test",
+            }
+            return True
+
+        MainWindow._try_auto_login = force_auto_login
+        MainWindow._apply_saved_configs = lambda self: None
+        MainWindow._load_data_for_page = lambda self, _page_id: None
+        MainWindow._apply_app_mode = lambda self: None
+        MainWindow._on_page_changed = lambda self, _page_id: None
+        MainWindow._check_auto_export = lambda self: None
+        MainWindow._auto_backup_config_on_login = lambda self: None
+        MainWindow._check_sync_health_on_login = lambda self: None
+
+        app = QApplication([])
+        window = MainWindow()
+        assert auto_login_calls == [True]
+        thread = window.sync_status_bar._version_check_thread
+        assert isinstance(thread, InterruptibleVersionCheckThread)
+        QTest.qWait(20)
+        assert thread.isRunning()
+
+        window.close()
+        app.processEvents()
+        assert not thread.isRunning()
+        """
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(CLIENT_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_visible_config_view_dispose_and_exit_without_native_thread_crash():
