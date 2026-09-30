@@ -187,14 +187,12 @@ class PortCheckThread(QThread):
 
 
 class ConfigGroup(QFrame):
-    """可折叠的配置分组卡片（手风琴模式：同丢时间只展弢丢个）"""
-
-    expanded_changed = Signal(object, bool)  # (self, is_expanded)
+    """始终展开的配置分组卡片。"""
 
     def __init__(self, title: str, group_type: str, parent=None):
         super().__init__(parent)
         self._group_type = group_type
-        self._expanded = False
+        self._expanded = True
         self._init_ui(title)
 
     def _init_ui(self, title: str):
@@ -213,9 +211,8 @@ class ConfigGroup(QFrame):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
 
-        # 标题栏（可点击折叠）
+        # 标题栏仅用于标识分组。
         self._header = QFrame()
-        self._header.setCursor(Qt.PointingHandCursor)
         self._header.setStyleSheet(f"""
             QFrame {{
                 background-color: {colors['bg']};
@@ -232,35 +229,29 @@ class ConfigGroup(QFrame):
         header_layout.addWidget(self._title_lbl)
         header_layout.addStretch()
 
-        self._toggle_btn = QLabel("▶")
+        self._toggle_btn = QLabel("▲")
         self._toggle_btn.setStyleSheet("color: #6b7280; font-size: 12px; background: transparent;")
         header_layout.addWidget(self._toggle_btn)
-
-        self._header.mousePressEvent = self._on_toggle
         self._layout.addWidget(self._header)
 
-        # 内容区域（默认收起）
+        # 内容区域始终可见，溢出由配置滚动区承接。
         self._content = QFrame()
         self._content.setStyleSheet("background-color: #ffffff; border: none;")
-        self._content.setVisible(False)
+        self._content.setVisible(True)
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(14, 10, 14, 14)
         self._content_layout.setSpacing(10)
         self._layout.addWidget(self._content)
 
-    def _on_toggle(self, event):
-        self._expanded = not self._expanded
-        self._toggle_btn.setText("▲" if self._expanded else "▶")
-        self._content.setVisible(self._expanded)
-        self.expanded_changed.emit(self, self._expanded)
 
     def content_layout(self):
         return self._content_layout
 
-    def set_expanded(self, expanded: bool):
-        self._expanded = expanded
-        self._toggle_btn.setText("▲" if expanded else "▶")
-        self._content.setVisible(expanded)
+    def set_expanded(self, expanded: bool = True):
+        """保持完整表单展开；滚动区处理可视范围之外的内容。"""
+        self._expanded = True
+        self._toggle_btn.setText("▲")
+        self._content.setVisible(True)
 
     def set_title(self, title: str):
         colors = GROUP_COLORS.get(self._group_type, GROUP_COLORS["database"])
@@ -644,9 +635,9 @@ class ConfigView(QWidget):
         self._build_update_form(group_update.content_layout())
         self._scroll_layout.addWidget(group_update)
 
-        # 手风琴模式：连接扢有分组的展开信号，同丢时间只展弢丢
+        # 所有配置组固定展开，配置滚动区负责承接完整表单的溢出。
         for grp in self._config_groups.values():
-            grp.expanded_changed.connect(self._on_group_expanded)
+            grp.set_expanded(True)
 
         self._scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -660,9 +651,23 @@ class ConfigView(QWidget):
         self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         # 保留旧属性，兼容既有内部访问。
         self._right_widget = self._status_panel
-        self._right_layout = QVBoxLayout(self._status_panel)
-        self._right_layout.setContentsMargins(0, 0, 0, 0)
+        status_panel_layout = QVBoxLayout(self._status_panel)
+        status_panel_layout.setContentsMargins(0, 0, 0, 0)
+        status_panel_layout.setSpacing(0)
+
+        # 状态卡始终位于独立滚动区内，避免断点切换时以标签页或隐藏控件取舍内容。
+        self._status_scroll = QScrollArea()
+        self._status_scroll.setMinimumSize(0, 0)
+        self._status_scroll.setWidgetResizable(True)
+        self._status_scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+        )
+        self._status_content = QWidget()
+        self._right_layout = QVBoxLayout(self._status_content)
+        self._right_layout.setContentsMargins(0, 0, 8, 0)
         self._right_layout.setSpacing(12)
+        self._status_scroll.setWidget(self._status_content)
+        status_panel_layout.addWidget(self._status_scroll)
 
         # 卡片 1：系统概
         self.card_overview = StatusCard(tr("config.card_overview"), "\U0001f4ca", "#2563eb")
@@ -815,15 +820,6 @@ class ConfigView(QWidget):
         else:
             self._refresh_status_value_displays()
 
-    # ==================== 手风琴模====================
-
-    def _on_group_expanded(self, group, is_expanded):
-        """??????????????????????"""
-        if not is_expanded:
-            return
-        for grp in self._config_groups.values():
-            if grp is not group:
-                grp.set_expanded(False)
 
     # ==================== 表单构建（与 v2.2 丢致）====================
 

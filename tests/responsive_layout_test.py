@@ -222,6 +222,68 @@ def test_config_view_reflows_existing_containers_without_recreating_controls(vis
     assert status_panel.parentWidget() is view._horizontal_area
     assert view.db_host is db_host
 
+def test_config_view_keeps_complete_config_and_status_content_across_breakpoints_offscreen():
+    """Python 3.11 离屏环境中，三档布局始终保留完整可访问的配置与状态内容。"""
+    script = textwrap.dedent(
+        """
+        import sys
+        from PySide6.QtWidgets import QApplication
+        from views.config_view import ConfigView
+
+        assert sys.version_info[:2] == (3, 11)
+        app = QApplication([])
+        view = ConfigView()
+        view.resize(1280, 900)
+        view.show()
+        app.processEvents()
+
+        groups = tuple(view._config_groups.values())
+        cards = (
+            view.card_overview,
+            view.card_mysql,
+            view.card_sync,
+            view.card_ftp,
+        )
+        assert len(groups) == 6
+        assert view._config_scroll.widget().isAncestorOf(groups[0])
+
+        status_content = view._status_scroll.widget()
+        status_layout = status_content.layout()
+        assert [status_layout.itemAt(index).widget() for index in range(4)] == list(cards)
+
+        card_ids = tuple(id(card) for card in cards)
+        timer = view._status_timer
+        timer_active = timer.isActive()
+        for mode in ("wide", "medium", "narrow"):
+            view.set_responsive_mode(mode)
+            app.processEvents()
+            assert all(
+                group._expanded and group._content.isVisible() and group.isVisible()
+                for group in groups
+            )
+            assert all(view._config_scroll.widget().isAncestorOf(group) for group in groups)
+            assert all(
+                status_content.isAncestorOf(card) and card.isVisible()
+                for card in cards
+            )
+            assert tuple(id(card) for card in cards) == card_ids
+            assert view._status_timer is timer
+            assert view._status_timer.isActive() is timer_active
+
+        view.dispose()
+        view.close()
+        app.processEvents()
+        """
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(CLIENT_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        timeout=20, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 def test_config_view_resize_selects_breakpoint_mode_only_when_it_changes(
     visible_config_view, monkeypatch
