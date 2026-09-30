@@ -228,3 +228,49 @@ def test_conflict_three_way_noop_refreshes_snapshot_without_notification(local_d
     assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
     assert local_db.get_snapshot(TABLE_MATERIALS, "material-1") == base
     assert notifications == []
+
+
+def test_force_sync_works_when_paused_and_not_after_stop(local_db: LocalDB):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    cycle_calls = []
+    engine._sync_cycle = lambda: cycle_calls.append(True)
+    try:
+        engine.pause_auto_sync()
+        assert engine._is_running is True
+        engine.force_sync()
+        assert cycle_calls == [True]
+
+        engine.stop()
+        assert engine._is_running is False
+        engine.force_sync()
+        assert cycle_calls == [True]
+    finally:
+        if engine._worker_thread.isRunning():
+            engine.stop()
+    assert app is not None
+
+
+def test_resume_auto_sync_restarts_timers_after_pause_and_stop(local_db: LocalDB):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    cycle_calls = []
+    engine._sync_cycle = lambda: cycle_calls.append(True)
+    try:
+        engine.pause_auto_sync()
+        engine.resume_auto_sync()
+        assert engine._is_running is True
+        assert engine._timer is not None and engine._timer.isActive()
+        assert engine._full_sync_timer is not None and engine._full_sync_timer.isActive()
+        assert cycle_calls == [True]
+
+        engine.stop()
+        engine.resume_auto_sync()
+        assert engine._is_running is True
+        assert engine._timer is not None and engine._timer.isActive()
+        assert engine._full_sync_timer is not None and engine._full_sync_timer.isActive()
+        assert cycle_calls == [True, True]
+    finally:
+        if engine._worker_thread.isRunning():
+            engine.stop()
+    assert app is not None

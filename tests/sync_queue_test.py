@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "client"))
 
+from config import TABLE_MATERIALS, TABLE_USERS
 from local_db import LocalDB
 
 
@@ -179,3 +180,99 @@ def test_pending_record_ids_exclude_succeeded_operations(local_db: LocalDB):
 
     assert local_db.mark_sync_succeeded(claimed["operation_id"], claimed["batch_id"])
     assert local_db.get_pending_record_ids("MMS_Materials") == set()
+
+
+def test_queue_count_excludes_succeeded_and_failed_operations(local_db: LocalDB):
+    local_db.enqueue_sync_operation(
+        table_name=TABLE_MATERIALS, operation="UPDATE", record_id="pending",
+        payload={"id": "pending"}, operation_id="count-pending",
+    )
+    local_db.enqueue_sync_operation(
+        table_name=TABLE_MATERIALS, operation="UPDATE", record_id="success",
+        payload={"id": "success"}, operation_id="count-success",
+    )
+    local_db.enqueue_sync_operation(
+        table_name=TABLE_MATERIALS, operation="UPDATE", record_id="failed",
+        payload={"id": "failed"}, operation_id="count-failed",
+    )
+    claimed = {item["operation_id"]: item for item in local_db.claim_sync_batch(limit=10)}
+    assert local_db.mark_sync_succeeded("count-success", claimed["count-success"]["batch_id"])
+    assert local_db.mark_sync_failed(
+        "count-failed", claimed["count-failed"]["batch_id"], "validation error",
+    )
+
+    assert local_db.get_sync_queue_count() == 1
+
+
+def test_atomic_local_change_and_queue_commit_and_rollback(local_db: LocalDB):
+    operation_id = "atomic-insert"
+    local_db.apply_local_change_with_sync(
+        TABLE_MATERIALS,
+        "INSERT",
+        "material-atomic",
+        {"id": "material-atomic", "material_code": "ATOMIC", "material_name": "原子物料"},
+        {"id": "material-atomic", "material_code": "ATOMIC", "material_name": "原子物料"},
+        operation_id=operation_id,
+    )
+
+    saved = next(row for row in local_db.query(TABLE_MATERIALS)
+                 if row["id"] == "material-atomic")
+    assert saved["material_code"] == "ATOMIC"
+    assert saved["workshop"] == "测试车间"
+    queued = local_db.get_sync_queue(limit=10)
+    assert [(item["operation_id"], item["operation"], item["record_id"])
+            for item in queued] == [(operation_id, "INSERT", "material-atomic")]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        local_db.apply_local_change_with_sync(
+            TABLE_MATERIALS,
+            "INSERT",
+            "material-rollback",
+            {"id": "material-rollback", "material_code": "ROLLBACK", "material_name": "不应提交"},
+            {"id": "material-rollback", "material_code": "ROLLBACK", "material_name": "不应提交"},
+            operation_id=operation_id,
+        )
+
+    assert not any(row["id"] == "material-rollback" for row in local_db.query(TABLE_MATERIALS))
+    assert local_db.get_sync_queue_count() == 1
+
+
+def test_atomic_update_and_delete_enqueue_in_same_transaction(local_db: LocalDB):
+    local_db.insert(TABLE_MATERIALS, {
+        "id": "material-update-delete", "material_code": "UPDATE-DELETE", "material_name": "旧名称",
+    })
+
+    local_db.apply_local_change_with_sync(
+        TABLE_MATERIALS, "UPDATE", "material-update-delete",
+        {"material_name": "新名称"},
+        {"id": "material-update-delete", "material_name": "新名称"},
+        operation_id="atomic-update",
+    )
+    assert next(row for row in local_db.query(TABLE_MATERIALS) if row["id"] == "material-update-delete")["material_name"] == "新名称"
+
+    local_db.apply_local_change_with_sync(
+        TABLE_MATERIALS, "DELETE", "material-update-delete", {}, {},
+        operation_id="atomic-delete",
+    )
+    assert not any(row["id"] == "material-update-delete" for row in local_db.query(TABLE_MATERIALS))
+    assert [(item["operation_id"], item["operation"])
+            for item in local_db.get_sync_queue(limit=10)] == [
+        ("atomic-update", "UPDATE"), ("atomic-delete", "DELETE"),
+    ]
+
+
+def test_atomic_shared_table_change_and_queue_use_one_transaction(local_db: LocalDB):
+    local_db.apply_local_change_with_sync(
+        TABLE_USERS,
+        "INSERT",
+        "atomic-user",
+        {
+            "id": "atomic-user", "username": "atomic-user", "password": "secret",
+            "display_name": "Atomic User",
+        },
+        {"id": "atomic-user", "username": "atomic-user"},
+        operation_id="atomic-shared-user",
+    )
+
+    assert local_db.query(TABLE_USERS, "id = ?", ("atomic-user",))[0]["username"] == "atomic-user"
+    assert local_db.get_sync_queue(limit=10)[0]["operation_id"] == "atomic-shared-user"

@@ -433,8 +433,7 @@ class SyncEngine(QObject):
         self._sync_cycle()
 
     def pause_auto_sync(self):
-        """暂停自动定时同步（半离线模式使用）
-        停止定时器但保持 Worker 线程，force_sync() 仍可手动触发"""
+        """暂停自动定时同步（半离线模式使用）。"""
         self._is_running = True
         if self._timer:
             self._timer.stop()
@@ -443,11 +442,8 @@ class SyncEngine(QObject):
         self._set_status(self.STATUS_OFFLINE)
 
     def resume_auto_sync(self):
-        """恢复自动定时同步（从半离线切回在线模式使用）"""
-        if self._is_running:
-            return
+        """恢复自动同步；暂停或完全停止后都重新启动 Worker 和计时器。"""
         self._is_running = True
-        # 确保 Worker 线程仍在运行
         if not self._worker_thread.isRunning():
             self._worker_thread.start()
         if self._timer is None:
@@ -461,8 +457,8 @@ class SyncEngine(QObject):
         self._sync_cycle()
 
     def stop(self):
-        """完全停止同步引擎（离线模式使用）"""
-        self._is_running = True
+        """完全停止同步引擎（离线模式使用）。"""
+        self._is_running = False
         if self._timer:
             self._timer.stop()
             self._timer = None
@@ -693,25 +689,36 @@ class SyncEngine(QObject):
     # ---------- 本地操作（主线程，快速）----------
 
     def offline_insert(self, table: str, record_id: str, data: Dict,
-                         add_to_queue: bool = True):
-        self.local_db.insert(table, self._convert_record(data))
+                       add_to_queue: bool = True):
+        converted = self._convert_record(data)
         if add_to_queue:
-            self.local_db.add_sync_queue(table, "INSERT", record_id, data)
+            self.local_db.apply_local_change_with_sync(
+                table, "INSERT", record_id, converted, data,
+            )
             self.queue_updated.emit(self.local_db.get_sync_queue_count())
+        else:
+            self.local_db.insert(table, converted)
 
     def offline_update(self, table: str, record_id: str, data: Dict,
                        add_to_queue: bool = True):
-        self.local_db.update(table, record_id, self._convert_record(data))
+        converted = self._convert_record(data)
         if add_to_queue:
-            self.local_db.add_sync_queue(table, "UPDATE", record_id, data)
+            self.local_db.apply_local_change_with_sync(
+                table, "UPDATE", record_id, converted, data,
+            )
             self.queue_updated.emit(self.local_db.get_sync_queue_count())
+        else:
+            self.local_db.update(table, record_id, converted)
 
     def offline_delete(self, table: str, record_id: str,
                        add_to_queue: bool = True):
-        self.local_db.delete(table, record_id)
         if add_to_queue:
-            self.local_db.add_sync_queue(table, "DELETE", record_id, {})
+            self.local_db.apply_local_change_with_sync(
+                table, "DELETE", record_id, {}, {},
+            )
             self.queue_updated.emit(self.local_db.get_sync_queue_count())
+        else:
+            self.local_db.delete(table, record_id)
 
     @staticmethod
     def _convert_record(record: Dict) -> Dict:

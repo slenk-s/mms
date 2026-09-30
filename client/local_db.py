@@ -1018,6 +1018,101 @@ class LocalDB:
 
     # ---------- 同步队列 ----------
 
+    def apply_local_change_with_sync(self, table: str, operation: str,
+                                     record_id: str, data: Dict[str, Any],
+                                     payload: Dict[str, Any],
+                                     operation_id: Optional[str] = None) -> int:
+        """在同一 SQLite 事务中写入本地业务数据和同步队列。"""
+        _validate_table(table)
+        if operation not in {"INSERT", "UPDATE", "DELETE"}:
+            raise ValueError(f"不支持的本地同步操作: {operation}")
+        operation_id = operation_id or str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        if table in SHARED_TABLES:
+            return self._apply_shared_change_with_sync(
+                table, operation, record_id, data, payload_json, operation_id,
+            )
+
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._execute_local_change(conn, table, operation, record_id, data)
+            queue_id = self._enqueue_sync_operation(
+                conn, table, operation, record_id, payload_json, operation_id,
+            )
+            conn.commit()
+            return queue_id
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _apply_shared_change_with_sync(self, table: str, operation: str,
+                                       record_id: str, data: Dict[str, Any],
+                                       payload_json: str, operation_id: str) -> int:
+        """共享表通过附加车间库，在一个 SQLite 事务中写入同步队列。"""
+        conn = self._shared_get_conn()
+        attached = False
+        try:
+            conn.execute("ATTACH DATABASE ? AS sync_queue_db", (self.db_path,))
+            attached = True
+            conn.execute("BEGIN IMMEDIATE")
+            self._execute_local_change(conn, table, operation, record_id, data)
+            queue_id = self._enqueue_sync_operation(
+                conn, table, operation, record_id, payload_json, operation_id,
+                queue_table="sync_queue_db.sync_queue",
+            )
+            conn.commit()
+            return queue_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if attached:
+                conn.execute("DETACH DATABASE sync_queue_db")
+
+    def _execute_local_change(self, conn: sqlite3.Connection, table: str,
+                              operation: str, record_id: str,
+                              data: Dict[str, Any]) -> None:
+        """在调用方持有的连接中执行单个本地业务变更。"""
+        if operation == "INSERT":
+            values = dict(data)
+            if table in WORKSHOP_TABLES and "workshop" not in values:
+                values["workshop"] = self._workshop
+            columns = ", ".join(values.keys())
+            placeholders = ", ".join("?" for _ in values)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_q(table)} ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+        elif operation == "UPDATE":
+            values = dict(data)
+            if table in WORKSHOP_TABLES and "workshop" not in values:
+                values["workshop"] = self._workshop
+            columns = ", ".join(f"{key} = ?" for key in values)
+            conn.execute(
+                f"UPDATE {_q(table)} SET {columns} WHERE id = ?",
+                tuple(values.values()) + (record_id,),
+            )
+        else:
+            conn.execute(f"DELETE FROM {_q(table)} WHERE id = ?", (record_id,))
+
+    def _enqueue_sync_operation(self, conn: sqlite3.Connection, table_name: str,
+                                operation: str, record_id: str,
+                                payload_json: str, operation_id: str,
+                                queue_table: str = "sync_queue") -> int:
+        sql = f"""
+            INSERT INTO {queue_table} (
+                operation_id, table_name, operation, record_id, payload, status,
+                attempt_count, status_updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
+        """
+        params = (
+            operation_id, table_name, operation, record_id, payload_json,
+            datetime.now().isoformat(),
+        )
+        return conn.execute(sql, params).lastrowid
+
     def add_sync_queue(self, table_name: str, operation: str,
                        record_id: str, payload: Dict) -> None:
         """兼容旧调用方的入队接口。"""
@@ -1029,20 +1124,15 @@ class LocalDB:
                                conn: Optional[sqlite3.Connection] = None) -> int:
         """写入一条 pending 操作；传入 conn 时由调用方控制同一事务。"""
         operation_id = operation_id or str(uuid.uuid4())
-        sql = """
-            INSERT INTO sync_queue (
-                operation_id, table_name, operation, record_id, payload, status,
-                attempt_count, status_updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
-        """
-        params = (
-            operation_id, table_name, operation, record_id,
-            json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(),
-        )
+        payload_json = json.dumps(payload, ensure_ascii=False)
         if conn is not None:
-            return conn.execute(sql, params).lastrowid
+            return self._enqueue_sync_operation(
+                conn, table_name, operation, record_id, payload_json, operation_id,
+            )
         with self._connect() as own_conn:
-            return own_conn.execute(sql, params).lastrowid
+            return self._enqueue_sync_operation(
+                own_conn, table_name, operation, record_id, payload_json, operation_id,
+            )
 
     def claim_sync_batch(self, limit: int = 50, now: Optional[str] = None,
                          batch_id: Optional[str] = None) -> List[Dict]:
@@ -1174,11 +1264,22 @@ class LocalDB:
         with self._connect() as conn:
             conn.execute(sql, (queue_id,))
 
-    def get_sync_queue_count(self) -> int:
-        sql = "SELECT COUNT(*) as count FROM sync_queue"
+    def get_sync_queue_count(self, statuses: Optional[Set[str]] = None) -> int:
+        """返回指定状态的同步项数；默认只统计仍需处理的项目。"""
+        statuses = statuses or {"pending", "retryable", "in_progress"}
+        placeholders = ", ".join("?" for _ in statuses)
+        sql = f"SELECT COUNT(*) as count FROM sync_queue WHERE status IN ({placeholders})"
         with self._connect() as conn:
-            cursor = conn.execute(sql)
+            cursor = conn.execute(sql, tuple(statuses))
             return cursor.fetchone()["count"]
+
+    def get_sync_queue_counts(self) -> Dict[str, int]:
+        """按状态返回队列计数，供同步诊断使用。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as count FROM sync_queue GROUP BY status"
+            ).fetchall()
+        return {row["status"]: row["count"] for row in rows}
 
     def get_sync_queue_item(self, queue_id: int) -> Optional[Dict]:
         sql = "SELECT * FROM sync_queue WHERE id = ?"
@@ -1191,7 +1292,7 @@ class LocalDB:
         """获取指定表中待同步的记录ID集合（防止云端覆盖本地未上传的修改）"""
         sql = """
             SELECT record_id FROM sync_queue
-            WHERE table_name = ? AND (status IS NULL OR status != 'succeeded')
+            WHERE table_name = ? AND status IN ('pending', 'retryable', 'in_progress')
         """
         with self._connect() as conn:
             cursor = conn.execute(sql, (table,))
