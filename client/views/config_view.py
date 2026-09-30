@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
-    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter,
+    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
@@ -495,6 +495,7 @@ class ConfigView(QWidget):
         self._stats_cache = None
         self._stats_cache_time = 0
         self._prog_dialog = None
+        self._is_disposed = False
         self._init_ui()
 
     # v2.3: 支持外部注入 LocalDB 实例
@@ -506,6 +507,7 @@ class ConfigView(QWidget):
 
     def showEvent(self, event):
         """?????????????????????????????????"""
+        self._is_disposed = False
         super().showEvent(event)
         # 轻量操作：立即刷新（不涉I/O
         self._refresh_web_urls()
@@ -521,9 +523,12 @@ class ConfigView(QWidget):
         self._stop_status_timer()
         self._cleanup_mysql_test_thread()
         self._cleanup_port_check_thread()
+        self._cleanup_ftp_test_thread()
 
     def _start_status_timer(self):
         """启动状面板定时刷新（仅在可见时有效）"""
+        if self._is_disposed:
+            return
         if not hasattr(self, '_status_timer'):
             self._status_timer = QTimer(self)
             self._status_timer.timeout.connect(self._update_status_panel)
@@ -542,16 +547,20 @@ class ConfigView(QWidget):
         self._outer_layout = QVBoxLayout(self)
         self._outer_layout.setContentsMargins(16, 16, 16, 16)
         self._outer_layout.setSpacing(12)
+        # 窄屏由各局部滚动/分割器承接溢出，根布局不可反向抬高窗口最小尺寸。
+        self._outer_layout.setSizeConstraint(QLayout.SetNoConstraint)
+        self.setMinimumSize(0, 0)
         self._responsive_mode = "wide"
 
         # 宽/中等模式由 splitter 分配主配置区与状态区，主配置区优先。
         self._horizontal_area = QSplitter(Qt.Horizontal)
         self._horizontal_area.setChildrenCollapsible(False)
+        self._horizontal_area.setMinimumSize(0, 0)
         self._horizontal_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # ==================== 左侧：配置表====================
         self._config_panel = QWidget()
-        self._config_panel.setMinimumWidth(620)
+        self._config_panel.setMinimumSize(0, 0)
         left_layout = QVBoxLayout(self._config_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
@@ -576,7 +585,9 @@ class ConfigView(QWidget):
         left_layout.addLayout(header)
 
         # 滚动区域
-        scroll = QScrollArea()
+        self._config_scroll = QScrollArea()
+        scroll = self._config_scroll
+        scroll.setMinimumSize(0, 0)
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
@@ -717,6 +728,7 @@ class ConfigView(QWidget):
         # 统计与快捷操作也复用同一组卡片，仅改变 splitter 的方向。
         self._bottom_stack = QSplitter(Qt.Horizontal)
         self._bottom_stack.setChildrenCollapsible(False)
+        self._bottom_stack.setMinimumSize(0, 0)
         self._bottom_stack.addWidget(self.card_stats)
         self._bottom_stack.addWidget(self.card_actions)
         self._bottom_stack.setStretchFactor(0, 1)
@@ -735,6 +747,7 @@ class ConfigView(QWidget):
             # 保持两个面板始终属于同一 splitter，只切换方向，避免 QWidget
             # 在 QSplitter 与普通布局之间重设父对象导致的销毁顺序问题。
             self._horizontal_area.setOrientation(Qt.Vertical)
+            self._config_panel.setMinimumWidth(0)
             self._status_panel.setMinimumWidth(0)
             self._status_panel.setMaximumWidth(16777215)
             self._status_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -742,6 +755,7 @@ class ConfigView(QWidget):
             self._bottom_stack.setOrientation(Qt.Vertical)
         else:
             self._horizontal_area.setOrientation(Qt.Horizontal)
+            self._config_panel.setMinimumWidth(620)
             self._status_panel.setMinimumWidth(240)
             self._status_panel.setMaximumWidth(16777215)
             self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -758,9 +772,21 @@ class ConfigView(QWidget):
         for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
             card.refresh_value_display()
 
+    @staticmethod
+    def _responsive_mode_for_width(width: int) -> str:
+        if width >= 1400:
+            return "wide"
+        if width >= 1100:
+            return "medium"
+        return "narrow"
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._refresh_status_value_displays()
+        mode = self._responsive_mode_for_width(self.contentsRect().width())
+        if mode != self._responsive_mode:
+            self.set_responsive_mode(mode)
+        else:
+            self._refresh_status_value_displays()
 
     # ==================== 手风琴模====================
 
@@ -1548,8 +1574,8 @@ class ConfigView(QWidget):
             self._sync_web_service_status()
             toast_info(self, tr("config.web_not_running"))
 
-    def _cleanup_web_process(self):
-        """清理 Web 服务进程"""
+    def _cleanup_web_process(self, sync_status: bool = True):
+        """清理 Web 服务进程；释放页面时可跳过会新建线程的状态同步。"""
         if self._web_process is not None:
             self._web_stopping_intentionally = True
             try:
@@ -1561,7 +1587,8 @@ class ConfigView(QWidget):
             except (RuntimeError, OSError):
                 pass
             self._web_process = None
-        self._sync_web_service_status()
+        if sync_status and not self._is_disposed:
+            self._sync_web_service_status()
 
     def _on_web_process_output(self):
         """处理 Web 服务进程输出"""
@@ -1588,7 +1615,7 @@ class ConfigView(QWidget):
 
     def _sync_web_service_status(self):
         """同步 Web 服务实际运行状态到启动/停止 UI"""
-        if self._is_syncing_web_status:
+        if self._is_disposed or self._is_syncing_web_status:
             return
         try:
             self._is_syncing_web_status = True
@@ -2231,6 +2258,8 @@ class ConfigView(QWidget):
     # ==================== 状面板更新（v2.3 核心优化===================
 
     def _update_status_panel(self):
+        if self._is_disposed:
+            return
         """状面板更仅在页面可见时调"""
         if self._local_db is None:
             return
@@ -2770,6 +2799,19 @@ class ConfigView(QWidget):
                 pass
             self._port_check_thread = None
 
+    def _cleanup_ftp_test_thread(self):
+        """清理 FTP 测试线程，确保页面销毁前没有后台回调。"""
+        if self._ftp_test_thread is not None:
+            try:
+                if self._ftp_test_thread.isRunning():
+                    self._ftp_test_thread.quit()
+                    if not self._ftp_test_thread.wait(1000):
+                        self._ftp_test_thread.terminate()
+                        self._ftp_test_thread.wait(500)
+            except RuntimeError:
+                pass
+            self._ftp_test_thread = None
+
     def eventFilter(self, obj, event):
         """双击 URL 标签即可复制到剪贴板"""
         if event.type() == QEvent.MouseButtonDblClick and obj in self._url_map:
@@ -2781,11 +2823,21 @@ class ConfigView(QWidget):
         return super().eventFilter(obj, event)
 
     def clear_memory(self):
-        """清理资源"""
+        """清理资源并保持页面可继续使用。"""
         self._stop_status_timer()
         self._cleanup_mysql_test_thread()
         self._cleanup_port_check_thread()
+        self._cleanup_ftp_test_thread()
         self._cleanup_web_process()
+
+    def dispose(self):
+        """确定性释放页面后台资源，不触发新的状态同步或后台线程。"""
+        self._is_disposed = True
+        self._stop_status_timer()
+        self._cleanup_mysql_test_thread()
+        self._cleanup_port_check_thread()
+        self._cleanup_ftp_test_thread()
+        self._cleanup_web_process(sync_status=False)
 
     # ==================== 车间管理 ====================
 

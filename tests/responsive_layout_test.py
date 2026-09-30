@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
 
 
 CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
@@ -34,15 +35,19 @@ def isolated_ui_settings(monkeypatch, tmp_path):
 
 @pytest.fixture
 def visible_config_view(qtbot):
-    """显式关闭配置页，确保 showEvent 启动的异步状态刷新完成清理。"""
+    """以确定性清理配置页后台资源，不依赖固定延迟。"""
     view = ConfigView()
     qtbot.addWidget(view)
     view.resize(1280, 900)
     view.show()
-    qtbot.wait(20)
+    QApplication.processEvents()
     yield view
+    view.dispose()
+    assert not view._status_timer.isActive()
+    assert view._mysql_test_thread is None
+    assert view._port_check_thread is None
+    assert view._ftp_test_thread is None
     view.close()
-    qtbot.wait(100)
 
 
 def test_navigation_collapses_and_expands_with_translated_tooltips(
@@ -163,6 +168,71 @@ def test_config_view_reflows_existing_containers_without_recreating_controls(vis
     view.set_responsive_mode("wide")
     assert status_panel.parentWidget() is view._horizontal_area
     assert view.db_host is db_host
+
+
+def test_config_view_resize_selects_breakpoint_mode_only_when_it_changes(
+    visible_config_view, monkeypatch
+):
+    """生产 resizeEvent 根据宽度切换模式，并避免同模式重复重排。"""
+    view = visible_config_view
+    view.resize(1400, 700)
+    QApplication.processEvents()
+    assert view._responsive_mode == "wide"
+
+    calls = []
+    original_set_mode = view.set_responsive_mode
+
+    def record_mode(mode):
+        calls.append(mode)
+        original_set_mode(mode)
+
+    monkeypatch.setattr(view, "set_responsive_mode", record_mode)
+
+    view.resize(1399, 700)
+    QApplication.processEvents()
+    assert view._responsive_mode == "medium"
+
+    view.resize(1200, 700)
+    QApplication.processEvents()
+    assert view._responsive_mode == "medium"
+
+    view.resize(1099, 700)
+    QApplication.processEvents()
+    assert view._responsive_mode == "narrow"
+    assert calls == ["medium", "narrow"]
+
+
+def test_config_view_narrow_geometry_keeps_configuration_scrollable_at_500_by_700(
+    visible_config_view,
+):
+    """500×700 窄屏不应被配置面板的固定最小尺寸撑大。"""
+    view = visible_config_view
+
+    view.resize(500, 700)
+    QApplication.processEvents()
+
+    assert view._responsive_mode == "narrow"
+    assert view.width() == 500
+    assert view.height() == 700
+    assert view._config_panel.minimumWidth() == 0
+    assert view.minimumHeight() <= 700
+    assert view._config_scroll.height() > 0
+    assert view._config_scroll.verticalScrollBar().maximum() > 0
+
+
+def test_config_view_dispose_stops_status_timer_and_threads(qtbot):
+    """确定性资源清理会停止状态计时器并释放线程引用。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    view._start_status_timer()
+
+    assert view._status_timer.isActive()
+    view.dispose()
+
+    assert not view._status_timer.isActive()
+    assert view._mysql_test_thread is None
+    assert view._port_check_thread is None
+    assert view._ftp_test_thread is None
 
 
 def test_config_view_rejects_unknown_responsive_mode(visible_config_view):
