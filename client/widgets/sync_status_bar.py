@@ -609,6 +609,7 @@ class SyncStatusBar(QWidget):
             "online": (tr("ssb.sync_synced"), "syncStatusOnline"),
             "offline": (tr("ssb.sync_offline"), "syncStatusOffline"),
             "syncing": (tr("ssb.sync_syncing"), "syncStatusSyncing"),
+            "unavailable": (tr("ssb.sync_unavailable"), "syncStatusOffline"),
         }
         text, obj_name = status_map.get(status, (tr("ssb.sync_unknown"), ""))
         self.sync_label.setText(text)
@@ -641,13 +642,17 @@ class SyncStatusBar(QWidget):
         self._last_sync_time_str = time_str
         self.last_sync_label.setText(tr("ssb.last_sync", time=time_str))
 
+    def set_force_sync_in_progress(self, in_progress: bool):
+        """设置立即同步按钮的受控忙碌状态，防止重复请求。"""
+        self._last_syncing = in_progress
+        self.sync_btn.setEnabled(not in_progress)
+        self.sync_btn.setText(
+            tr("ssb.syncing_now") if in_progress else tr("ssb.force_sync")
+        )
+
     def set_syncing(self, is_syncing: bool):
-        self._last_syncing = is_syncing
-        self.sync_btn.setEnabled(not is_syncing)
-        if is_syncing:
-            self.sync_btn.setText(tr("ssb.syncing_now"))
-        else:
-            self.sync_btn.setText(tr("ssb.force_sync"))
+        """兼容旧调用方；新代码请使用 set_force_sync_in_progress。"""
+        self.set_force_sync_in_progress(is_syncing)
 
     def retranslate_ui(self):
         self.network_label.setText(tr("ssb.network_detecting"))

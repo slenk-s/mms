@@ -454,6 +454,9 @@ class MainWindow(QMainWindow):
         # 刷新同步标志：标记刷新请求，同步完成后自动刷新页面
         self._refresh_pending: bool = False
 
+        # 手动同步在完成/失败信号前保持锁定，避免重复点击重复派发。
+        self._force_sync_in_progress: bool = False
+
         # 延迟刷新定时器：合并短时间内多次刷新请求
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -605,14 +608,8 @@ class MainWindow(QMainWindow):
         self.nav_bar.logout_clicked.connect(self._on_logout)
 
         # 同步
-        self.sync_engine.sync_status_changed.connect(self.sync_status_bar.set_sync_status)
-        self.sync_engine.queue_updated.connect(self.sync_status_bar.set_queue_count)
-        self.sync_engine.batch_conflict_detected.connect(self._on_conflict_notify)
-        # sync_started 传的是同步类型(push/pull/full_sync)，不是状态值，统一映射为 syncing
-        self.sync_engine.sync_started.connect(lambda _: self.sync_status_bar.set_sync_status("syncing"))
-        self.sync_engine.sync_completed.connect(self._on_sync_completed)
+        self._connect_sync_signals()
         self.sync_status_bar.update_available_changed.connect(self._on_update_available_changed)
-        self.sync_status_bar.force_sync_clicked.connect(self.sync_engine.force_sync)
         self.sync_status_bar.language_switch_clicked.connect(self._on_switch_language)
         self.network_monitor.status_changed.connect(self._on_network_changed)
 
@@ -645,6 +642,7 @@ class MainWindow(QMainWindow):
         self.user_manage_view.add_user.connect(self._on_add_user)
         self.user_manage_view.update_user.connect(self._on_update_user)
         self.user_manage_view.delete_user.connect(self._on_delete_user)
+
         self.user_manage_view.toggle_user_status.connect(self._on_toggle_user_status)
         self.user_manage_view.refresh_requested.connect(self._request_refresh)
 
@@ -653,6 +651,70 @@ class MainWindow(QMainWindow):
         self.user_manage_view.employee_edit_requested.connect(self._on_employee_edit_requested)
         self.user_manage_view.employee_delete_requested.connect(self._on_employee_delete_requested)
         self.user_manage_view.employee_data_requested.connect(self._on_employee_data_requested)
+
+    def _connect_sync_signals(self):
+        """连接同步 UI 信号，集中维护状态栏的同步生命周期。"""
+        self.sync_engine.sync_status_changed.connect(self.sync_status_bar.set_sync_status)
+        self.sync_engine.queue_updated.connect(self.sync_status_bar.set_queue_count)
+        self.sync_engine.batch_conflict_detected.connect(self._on_conflict_notify)
+        self.sync_engine.sync_started.connect(self._on_sync_started)
+        self.sync_engine.sync_completed.connect(self._on_sync_completed)
+        self.sync_engine.sync_failed.connect(self._on_sync_failed)
+        self.sync_status_bar.force_sync_clicked.connect(self._on_force_sync_clicked)
+
+    def _refresh_sync_queue_count(self):
+        """从本地数据库读取真实待同步数，避免使用陈旧 UI 缓存。"""
+        try:
+            self.sync_status_bar.set_queue_count(self.local_db.get_sync_queue_count())
+        except (sqlite3.Error, RuntimeError, ValueError) as e:
+            _log.warning("刷新待同步数量失败: %s", e)
+        except Exception as e:
+            _log.warning("刷新待同步数量出现未预期异常: %s", e)
+
+    def _on_sync_started(self, _sync_type: str):
+        """同步引擎开始任意同步流程时立即更新状态栏。"""
+        self._force_sync_in_progress = True
+        self.sync_status_bar.set_sync_status("syncing")
+        self.sync_status_bar.set_force_sync_in_progress(True)
+
+    def _on_force_sync_clicked(self):
+        """按运行模式和引擎状态受控发起手动同步。"""
+        from widgets.toast import toast_info
+
+        if self._force_sync_in_progress:
+            return
+        if self._app_mode == "offline":
+            self.sync_status_bar.set_sync_status("offline")
+            message = tr("toast.offline_mode_sync_disabled")
+            self.status_bar.showMessage(message)
+            toast_info(self, message)
+            return
+
+        engine_state = getattr(self.sync_engine, "state", None)
+        allowed_states = (
+            getattr(self.sync_engine, "PAUSED", "PAUSED"),
+            getattr(self.sync_engine, "RUNNING", "RUNNING"),
+        )
+        if engine_state not in allowed_states:
+            self.sync_status_bar.set_sync_status("unavailable")
+            message = tr("toast.sync_engine_stopped")
+            self.status_bar.showMessage(message)
+            toast_info(self, message)
+            return
+
+        self._force_sync_in_progress = True
+        self.sync_status_bar.set_sync_status("syncing")
+        self.sync_status_bar.set_force_sync_in_progress(True)
+        try:
+            self.sync_engine.force_sync()
+        except Exception as e:
+            _log.warning("立即同步启动失败: %s", e)
+            self._force_sync_in_progress = False
+            self.sync_status_bar.set_force_sync_in_progress(False)
+            self._refresh_sync_queue_count()
+            message = tr("toast.sync_engine_stopped")
+            self.status_bar.showMessage(message)
+            toast_info(self, message)
 
     def _on_update_available_changed(self, available: bool, remote_ver: int):
         if available and remote_ver > 0:
@@ -1110,6 +1172,8 @@ class MainWindow(QMainWindow):
         self.nav_bar.setVisible(True)
         self.sync_status_bar.setVisible(True)
         self.stacked_widget.setVisible(True)
+        # 每次登录进入主界面均从 SQLite 读取，不能沿用上次会话的显示值。
+        self._refresh_sync_queue_count()
 
         self.nav_bar.set_library_name(self._library_name)
         self.nav_bar.set_user_info(username, role)
@@ -1141,7 +1205,10 @@ class MainWindow(QMainWindow):
             self.sync_engine.refresh_pull()
 
     def _on_sync_completed(self, sync_type: str, count: int):
-        """同步完成后丢弃本地快照并异步重载当前页面。"""
+        """同步完成后恢复手动同步入口、刷新队列并异步重载当前页面。"""
+        self._force_sync_in_progress = False
+        self.sync_status_bar.set_force_sync_in_progress(False)
+        self._refresh_sync_queue_count()
         if count > 0:
             self._invalidate_page_cache()
         if self._refresh_pending:
@@ -1154,6 +1221,12 @@ class MainWindow(QMainWindow):
         elif sync_type == "cycle" and count > 0:
             self._request_page_load(self._current_page, force=True)
             self.status_bar.showMessage(tr("toast.records_pulled", count=count))
+
+    def _on_sync_failed(self, _sync_type: str, _error: str):
+        """同步失败后恢复操作入口，并显示本地数据库中的真实待同步数。"""
+        self._force_sync_in_progress = False
+        self.sync_status_bar.set_force_sync_in_progress(False)
+        self._refresh_sync_queue_count()
 
     def _invalidate_page_cache(self, *page_ids: str):
         """使页面快照和进行中的旧请求失效。"""
