@@ -746,6 +746,8 @@ class ConfigView(QWidget):
         self._outer_layout.addWidget(self._horizontal_area, stretch=1)
 
         # 统计与快捷操作也复用同一组卡片，仅改变 splitter 的方向。
+        # 窄屏时由外层滚动区承接纵向 splitter 的完整内容，避免底部卡片
+        # 被压缩后将车间标签或管理按钮裁切在可视区域之外。
         self._bottom_stack = QSplitter(Qt.Horizontal)
         self._bottom_stack.setChildrenCollapsible(False)
         self._bottom_stack.setMinimumSize(0, 0)
@@ -753,9 +755,17 @@ class ConfigView(QWidget):
         self._bottom_stack.addWidget(self.card_actions)
         self._bottom_stack.setStretchFactor(0, 1)
         self._bottom_stack.setStretchFactor(1, 1)
+        self._bottom_scroll = QScrollArea()
+        self._bottom_scroll.setMinimumSize(0, 0)
+        self._bottom_scroll.setWidgetResizable(True)
+        self._bottom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._bottom_scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+        )
+        self._bottom_scroll.setWidget(self._bottom_stack)
         # 保留旧属性，兼容既有内部访问。
         self._bottom_area = self._bottom_stack
-        self._outer_layout.addWidget(self._bottom_stack, stretch=0)
+        self._outer_layout.addWidget(self._bottom_scroll, stretch=0)
         self.set_responsive_mode(self._responsive_mode)
 
     def set_responsive_mode(self, mode: str):
@@ -788,10 +798,22 @@ class ConfigView(QWidget):
             QBoxLayout.TopToBottom if mode == "narrow" else QBoxLayout.LeftToRight
         )
         self._workshop_layout.invalidate()
+        self.card_stats.layout().invalidate()
+        self.card_stats.layout().activate()
+        self.card_stats.updateGeometry()
         self.card_actions.layout().invalidate()
         self.card_actions.layout().activate()
         self.card_actions.updateGeometry()
         self._bottom_stack.updateGeometry()
+        if mode in {"medium", "narrow"}:
+            bottom_content_height = (
+                self.card_stats.minimumSizeHint().height()
+                + self.card_actions.minimumSizeHint().height()
+                + self._bottom_stack.handleWidth()
+            )
+            self._bottom_stack.setMinimumHeight(bottom_content_height)
+        else:
+            self._bottom_stack.setMinimumHeight(0)
         self._outer_layout.invalidate()
         self._outer_layout.activate()
         self._responsive_mode = mode

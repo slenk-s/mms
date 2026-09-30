@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtCore import Qt, QPoint, QRect
 from PySide6.QtWidgets import QApplication, QBoxLayout
 
 
@@ -374,6 +374,47 @@ def test_config_view_narrow_geometry_keeps_configuration_scrollable_at_500_by_70
     assert view.minimumHeight() <= 700
     assert view._config_scroll.height() > 0
     assert view._config_scroll.verticalScrollBar().maximum() > 0
+
+
+def test_config_view_narrow_bottom_auxiliary_controls_scroll_without_clipping(
+    visible_config_view,
+):
+    """500×700 窄屏的统计和快捷操作可滚动，车间控件不会被部分裁切。"""
+    view = visible_config_view
+    view.resize(500, 700)
+    QApplication.processEvents()
+
+    bottom_scroll = view._bottom_scroll
+    viewport = bottom_scroll.viewport()
+    controls = (
+        view.btn_export,
+        view.btn_import,
+        view.btn_clear_queue,
+        view.lbl_workshop,
+        view.cbx_workshop,
+        view.btn_workshop_manage,
+    )
+
+    assert view._responsive_mode == "narrow"
+    assert bottom_scroll.verticalScrollBar().maximum() > 0
+    scroll_bar = bottom_scroll.verticalScrollBar()
+    for control in controls:
+        scroll_bar.setValue(0)
+        QApplication.processEvents()
+        content_rect = QRect(
+            control.mapTo(bottom_scroll.widget(), control.rect().topLeft()),
+            control.size(),
+        )
+        scroll_bar.setValue(min(
+            scroll_bar.maximum(), max(0, content_rect.bottom() - viewport.height() + 1)
+        ))
+        QApplication.processEvents()
+        control_rect = QRect(
+            control.mapTo(viewport, control.rect().topLeft()), control.size()
+        )
+        assert viewport.rect().contains(control_rect), (
+            control, control_rect, viewport.rect()
+        )
 
 
 class _UnstoppableThread:
