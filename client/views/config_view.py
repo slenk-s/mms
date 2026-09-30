@@ -2237,13 +2237,21 @@ class ConfigView(QWidget):
             toast_error(self, tr("toast.test_need_host"))
             return
 
+        if self._mysql_test_thread is not None:
+            try:
+                if self._mysql_test_thread.isRunning():
+                    return
+            except RuntimeError:
+                pass
+
         toast_info(self, tr("toast.test_connecting"), 2000)
 
         # 使用后台线程执行连接测试，完成后通过信号返回结果
-        self._mysql_test_thread = MySQLTestThread(
+        thread = MySQLTestThread(
             host=host, port=port, user=user, password=password,
             database=database, charset=charset, parent=self
         )
+        self._mysql_test_thread = thread
 
         def _on_result(is_online: bool, detail: str):
             if is_online:
@@ -2252,9 +2260,11 @@ class ConfigView(QWidget):
                 toast_error(self, tr("toast.test_fail", detail=detail), 4000)
             self._on_mysql_test_result(is_online, detail)
 
-        self._mysql_test_thread.test_finished.connect(_on_result)
-        self._mysql_test_thread.finished.connect(self._cleanup_mysql_thread)
-        self._mysql_test_thread.start()
+        thread.test_finished.connect(_on_result)
+        thread.finished.connect(
+            lambda thread=thread: self._cleanup_mysql_thread(thread)
+        )
+        thread.start()
 
     # ==================== 状面板更新（v2.3 核心优化===================
 
@@ -2433,13 +2443,16 @@ class ConfigView(QWidget):
             return
 
         # 创建并启动后台线
-        self._mysql_test_thread = MySQLTestThread(
+        thread = MySQLTestThread(
             host=host, port=port, user=user, password=password,
             database=database, charset=charset, parent=self
         )
-        self._mysql_test_thread.test_finished.connect(self._on_mysql_test_result)
-        self._mysql_test_thread.finished.connect(self._cleanup_mysql_thread)
-        self._mysql_test_thread.start()
+        self._mysql_test_thread = thread
+        thread.test_finished.connect(self._on_mysql_test_result)
+        thread.finished.connect(
+            lambda thread=thread: self._cleanup_mysql_thread(thread)
+        )
+        thread.start()
 
     def _on_mysql_test_result(self, is_online: bool, detail: str):
         """MySQL 棢测完成的回调（在主线程执行，安全更新 UI"""
@@ -2458,9 +2471,12 @@ class ConfigView(QWidget):
             # 清除错误
             self.card_mysql.clear_row("error")
 
-    def _cleanup_mysql_thread(self):
-        """线程完成后的清理（在主线程执行，安全重置引用"""
-        self._mysql_test_thread = None
+    def _cleanup_mysql_thread(self, thread=None):
+        """仅清理发出 finished 的 MySQL 线程，保留可能已替换的新线程。"""
+        self._clear_finished_thread(
+            "_mysql_test_thread",
+            self._mysql_test_thread if thread is None else thread,
+        )
 
     def _async_update_ftp_status(self):
         """后台线程异步棢FTP 状"""
@@ -2486,10 +2502,15 @@ class ConfigView(QWidget):
             return
         self.card_ftp.set_status_row("status", tr("config.status_checking"), False)
         self.card_ftp.set_row("host", tr("config.label_ftp_host"), f"{host}:{port}")
-        self._ftp_test_thread = _FtpTestThread(host, port, user, password, directory=cfg.get("directory", ""), parent=self)
-        self._ftp_test_thread.test_finished.connect(self._on_ftp_test_result)
-        self._ftp_test_thread.finished.connect(self._cleanup_ftp_thread)
-        self._ftp_test_thread.start()
+        thread = _FtpTestThread(
+            host, port, user, password, directory=cfg.get("directory", ""), parent=self
+        )
+        self._ftp_test_thread = thread
+        thread.test_finished.connect(self._on_ftp_test_result)
+        thread.finished.connect(
+            lambda thread=thread: self._cleanup_ftp_thread(thread)
+        )
+        thread.start()
 
     def _on_ftp_test_result(self, is_online: bool, detail: str):
         """FTP 棢测完成的回调"""
@@ -2501,8 +2522,12 @@ class ConfigView(QWidget):
             if detail:
                 self.card_ftp.set_error_row("error", detail[:200])
 
-    def _cleanup_ftp_thread(self):
-        self._ftp_test_thread = None
+    def _cleanup_ftp_thread(self, thread=None):
+        """仅清理发出 finished 的 FTP 线程，保留可能已替换的新线程。"""
+        self._clear_finished_thread(
+            "_ftp_test_thread",
+            self._ftp_test_thread if thread is None else thread,
+        )
 
     # ==================== 配置导入导出（与 v2.2 丢致）====================
 

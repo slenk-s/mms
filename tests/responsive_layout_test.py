@@ -269,6 +269,32 @@ def test_cleanup_running_thread_requests_quit_without_wait_or_terminate(qtbot):
     assert view._mysql_test_thread is thread
 
 
+def test_mysql_finished_cleanup_keeps_replacement_thread(qtbot):
+    """旧 MySQL 线程的 finished 回调不能清空已替换的新线程。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    thread_a = object()
+    thread_b = object()
+    view._mysql_test_thread = thread_b
+
+    view._cleanup_mysql_thread(thread_a)
+
+    assert view._mysql_test_thread is thread_b
+
+
+def test_ftp_finished_cleanup_keeps_replacement_thread(qtbot):
+    """旧 FTP 线程的 finished 回调不能清空已替换的新线程。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    thread_a = object()
+    thread_b = object()
+    view._ftp_test_thread = thread_b
+
+    view._cleanup_ftp_thread(thread_a)
+
+    assert view._ftp_test_thread is thread_b
+
+
 def test_config_view_dispose_stops_status_timer_and_threads(qtbot):
     """确定性资源清理会停止状态计时器并释放线程引用。"""
     view = ConfigView()
