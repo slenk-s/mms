@@ -170,3 +170,61 @@ def test_conflict_result_keeps_three_way_conflict_notification(local_db: LocalDB
     finally:
         engine.stop()
     assert app is not None
+
+
+def _run_conflict_result(local_db: LocalDB, item, conflict):
+    """在真实 Qt Engine 中处理构造的冲突结果。"""
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    notifications = []
+    engine.batch_conflict_detected.connect(notifications.append)
+    engine._start_pull = lambda: None
+    try:
+        engine._on_worker_push_result([
+            {"item": item, "outcome": "conflict", "error": "", "conflict_info": conflict},
+        ], 1, "")
+    finally:
+        engine.stop()
+    assert app is not None
+    return notifications
+
+
+def test_conflict_three_way_merge_preserves_non_overlapping_local_and_cloud_changes(local_db: LocalDB):
+    item = _claimed_item(local_db, "op-three-way-merge")
+    base = {
+        "id": "material-1", "material_code": "M-merge",
+        "material_name": "基线名称", "location": "A",
+        "updated_at": "2026-09-29T09:00:00",
+    }
+    local_payload = {**base, "material_name": "本地名称", "updated_at": "2026-09-29T10:00:00"}
+    cloud_record = {**base, "location": "B", "updated_at": "2026-09-29T11:00:00"}
+    local_db.insert(TABLE_MATERIALS, {**base, "workshop": "测试车间"})
+    local_db.save_snapshot(TABLE_MATERIALS, "material-1", base)
+    notifications = _run_conflict_result(local_db, item, {
+        "table": TABLE_MATERIALS, "record_id": "material-1",
+        "cloud": cloud_record, "local": local_payload,
+    })
+
+    snapshot = local_db.get_snapshot(TABLE_MATERIALS, "material-1")
+    assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+    assert snapshot["material_name"] == "本地名称"
+    assert snapshot["location"] == "B"
+    assert notifications == []
+
+
+def test_conflict_three_way_noop_refreshes_snapshot_without_notification(local_db: LocalDB):
+    item = _claimed_item(local_db, "op-three-way-noop")
+    base = {
+        "id": "material-1", "material_code": "M-noop",
+        "material_name": "基线名称", "location": "A",
+        "updated_at": "2026-09-29T09:00:00",
+    }
+    local_db.save_snapshot(TABLE_MATERIALS, "material-1", base)
+    notifications = _run_conflict_result(local_db, item, {
+        "table": TABLE_MATERIALS, "record_id": "material-1",
+        "cloud": dict(base), "local": dict(base),
+    })
+
+    assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+    assert local_db.get_snapshot(TABLE_MATERIALS, "material-1") == base
+    assert notifications == []
