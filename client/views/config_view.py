@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
     QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout,
+    QStackedWidget,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
@@ -32,6 +33,7 @@ from config import (
     TABLE_MATERIALS, TABLE_BORROW_RECORDS, TABLE_FIXED_ASSETS, TABLE_CONFIG_ITEMS,
 )
 from logger import get_logger
+from utils.ui_settings import restore_ui_preference, save_ui_preference
 
 _log = get_logger(__name__)
 
@@ -644,9 +646,13 @@ class ConfigView(QWidget):
         self._build_update_form(group_update.content_layout())
         self._scroll_layout.addWidget(group_update)
 
-        # 手风琴模式：连接扢有分组的展开信号，同丢时间只展弢丢
+        # 手风琴模式：同一时间只展开一个分组，且至少保留一个展开项。
         for grp in self._config_groups.values():
             grp.expanded_changed.connect(self._on_group_expanded)
+        saved_group = restore_ui_preference("config_group", "database")
+        self._select_config_group(
+            saved_group if saved_group in self._config_groups else "database", save=False
+        )
 
         self._scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -665,33 +671,67 @@ class ConfigView(QWidget):
         self._right_layout.setSpacing(12)
 
         # 卡片 1：系统概
-        self.card_overview = StatusCard(tr("config.card_overview"), "\U0001f4ca", "#2563eb")
+        self._status_tabs = {}
+        status_tab_bar = QWidget()
+        status_tab_layout = QHBoxLayout(status_tab_bar)
+        status_tab_layout.setContentsMargins(0, 0, 0, 0)
+        status_tab_layout.setSpacing(4)
+        for key, label in (("overview", "概览"), ("mysql", "MySQL"),
+                           ("sync", "同步"), ("ftp", "FTP")):
+            tab = QPushButton(label)
+            tab.setCheckable(True)
+            tab.setStyleSheet("""
+                QPushButton {
+                    background: #f3f4f6; color: #4b5563; border: none;
+                    border-radius: 5px; padding: 6px 10px; font-size: 12px;
+                }
+                QPushButton:checked { background: #2563eb; color: white; font-weight: bold; }
+            """)
+            tab.clicked.connect(lambda _checked=False, card_key=key: self._select_status_card(card_key))
+            status_tab_layout.addWidget(tab)
+            self._status_tabs[key] = tab
+        status_tab_layout.addStretch()
+        self._right_layout.addWidget(status_tab_bar)
+
+        self._status_stack = QStackedWidget()
+        self._status_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._right_layout.addWidget(self._status_stack, 1)
+
+        # 卡片实例仅创建一次；标签切换通过 stacked widget 改变可见性。
+        self.card_overview = StatusCard(tr("config.card_overview"), "📊", "#2563eb")
         self.card_overview.set_row("version", tr("config.label_version"), APP_VERSION)
         self.card_overview.set_row("mode", tr("config.label_mode"), APP_MODE)
         self.card_overview.set_row("db_file", tr("config.label_db_file"), "...")
         self.card_overview.set_row("total", tr("config.label_total"), "0")
-        self._right_layout.addWidget(self.card_overview)
 
-        # 卡片 2：MySQL 连接
-        self.card_mysql = StatusCard(tr("config.card_mysql"), "\U0001f5c4", "#10b981")
+        self.card_mysql = StatusCard(tr("config.card_mysql"), "🗄", "#10b981")
         self.card_mysql.set_status_row("status", tr("config.status_checking"), False)
-        self.card_mysql.set_row("host", tr("config.label_host"), "..." )
-        self.card_mysql.set_row("port", tr("config.label_port"), "..." )
-        self.card_mysql.set_row("db", tr("config.label_db"), "..." )
-        self._right_layout.addWidget(self.card_mysql)
+        self.card_mysql.set_row("host", tr("config.label_host"), "...")
+        self.card_mysql.set_row("port", tr("config.label_port"), "...")
+        self.card_mysql.set_row("db", tr("config.label_db"), "...")
 
-        # 卡片 3：同步状态（移到右侧
-        self.card_sync = StatusCard(tr("config.card_sync"), "\U0001f504", "#f59e0b")
+        self.card_sync = StatusCard(tr("config.card_sync"), "🔄", "#f59e0b")
         self.card_sync.set_row("queue", tr("config.label_queue"), tr("config.records_count", count=0), "#059669")
-        self.card_sync.set_row("last_push", tr("config.label_last_push"), "..." )
-        self.card_sync.set_row("last_pull", tr("config.label_last_pull"), "..." )
-        self._right_layout.addWidget(self.card_sync)
+        self.card_sync.set_row("last_push", tr("config.label_last_push"), "...")
+        self.card_sync.set_row("last_pull", tr("config.label_last_pull"), "...")
 
-        # 卡片 4：FTP 状
-        self.card_ftp = StatusCard(tr("config.card_ftp"), "\U0001f4e1", "#06b6d4")
+        self.card_ftp = StatusCard(tr("config.card_ftp"), "📡", "#06b6d4")
         self.card_ftp.set_status_row("status", tr("config.status_checking"), False)
-        self.card_ftp.set_row("host", tr("config.label_ftp_host"), "..." )
-        self._right_layout.addWidget(self.card_ftp)
+        self.card_ftp.set_row("host", tr("config.label_ftp_host"), "...")
+
+        self._status_cards = {
+            "overview": self.card_overview,
+            "mysql": self.card_mysql,
+            "sync": self.card_sync,
+            "ftp": self.card_ftp,
+        }
+        for card in self._status_cards.values():
+            self._status_stack.addWidget(card)
+        saved_status_card = restore_ui_preference("config_status_card", "overview")
+        self._select_status_card(
+            saved_status_card if saved_status_card in self._status_cards else "overview",
+            save=False,
+        )
 
         # 卡片 4：数据量统计（移到底部，不占用右侧分栏）
         stat_card = StatusCard(tr("config.card_stats"), "\U0001f4c8", "#8b5cf6")
@@ -733,7 +773,6 @@ class ConfigView(QWidget):
         # 车间切换区域
         self._init_workshop_selector()
 
-        self._right_layout.addStretch()
         self._horizontal_area.addWidget(self._status_panel)
         self._horizontal_area.setStretchFactor(0, 3)
         self._horizontal_area.setStretchFactor(1, 1)
@@ -815,15 +854,38 @@ class ConfigView(QWidget):
         else:
             self._refresh_status_value_displays()
 
-    # ==================== 手风琴模====================
+    # ==================== 配置手风琴与状态标签 ====================
+
+    def _select_config_group(self, key: str, save: bool = True):
+        """选择唯一展开的配置分组，避免配置区出现全部收起的状态。"""
+        if key not in self._config_groups:
+            key = "database"
+        for group_key, group in self._config_groups.items():
+            group.set_expanded(group_key == key)
+        if save:
+            save_ui_preference("config_group", key)
 
     def _on_group_expanded(self, group, is_expanded):
-        """??????????????????????"""
-        if not is_expanded:
-            return
-        for grp in self._config_groups.values():
-            if grp is not group:
-                grp.set_expanded(False)
+        """用户点击标题时保持单选展开，并记忆最后选择。"""
+        key = next(
+            (group_key for group_key, candidate in self._config_groups.items()
+             if candidate is group),
+            "database",
+        )
+        if is_expanded:
+            self._select_config_group(key)
+        elif not any(candidate._expanded for candidate in self._config_groups.values()):
+            self._select_config_group(key, save=False)
+
+    def _select_status_card(self, key: str, save: bool = True):
+        """只切换既有状态卡的可见性，不重建状态控件或后台任务。"""
+        if key not in self._status_cards:
+            key = "overview"
+        self._status_stack.setCurrentWidget(self._status_cards[key])
+        for card_key, tab in self._status_tabs.items():
+            tab.setChecked(card_key == key)
+        if save:
+            save_ui_preference("config_status_card", key)
 
     # ==================== 表单构建（与 v2.2 丢致）====================
 
