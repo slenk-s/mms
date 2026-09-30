@@ -44,9 +44,6 @@ def visible_config_view(qtbot):
     yield view
     view.dispose()
     assert not view._status_timer.isActive()
-    assert view._mysql_test_thread is None
-    assert view._port_check_thread is None
-    assert view._ftp_test_thread is None
     view.close()
 
 
@@ -220,6 +217,58 @@ def test_config_view_narrow_geometry_keeps_configuration_scrollable_at_500_by_70
     assert view._config_scroll.verticalScrollBar().maximum() > 0
 
 
+class _UnstoppableThread:
+    """模拟已请求退出但尚未发出 finished 的后台线程。"""
+
+    def __init__(self):
+        self.quit_calls = 0
+        self.wait_calls = 0
+        self.terminate_calls = 0
+
+    def isRunning(self):
+        return True
+
+    def quit(self):
+        self.quit_calls += 1
+
+    def wait(self, *_args):
+        self.wait_calls += 1
+        return False
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+
+def test_clear_memory_never_starts_port_check_thread(qtbot, monkeypatch):
+    """释放内存不能经由 Web 状态同步启动新的端口检测线程。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    sync_calls = []
+    monkeypatch.setattr(
+        view, "_sync_web_service_status", lambda: sync_calls.append("sync")
+    )
+
+    view.clear_memory()
+
+    assert sync_calls == []
+    assert view._port_check_thread is None
+
+
+def test_cleanup_running_thread_requests_quit_without_wait_or_terminate(qtbot):
+    """仍在运行的线程保留引用，等待 finished 槽统一清理。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    thread = _UnstoppableThread()
+    view._mysql_test_thread = thread
+
+    view._cleanup_mysql_test_thread()
+
+    assert thread.quit_calls == 1
+    assert thread.wait_calls == 0
+    assert thread.terminate_calls == 0
+    assert view._mysql_test_thread is thread
+
+
 def test_config_view_dispose_stops_status_timer_and_threads(qtbot):
     """确定性资源清理会停止状态计时器并释放线程引用。"""
     view = ConfigView()
@@ -249,18 +298,18 @@ def test_status_card_elides_long_value_and_keeps_full_tooltip(qtbot):
     card.set_row("endpoint", "服务地址", full_value)
     card.resize(180, 120)
     card.show()
-    qtbot.wait(20)
+    QApplication.processEvents()
 
     value_label = card._rows["endpoint"][1]
     assert value_label.toolTip() == full_value
     assert value_label.text() != full_value
 
     card.resize(9000, 120)
-    qtbot.wait(20)
+    QApplication.processEvents()
     assert value_label.text() == full_value
     assert value_label.toolTip() == ""
 
     card.set_value("endpoint", "诊断内容：" + full_value, wrap=True)
-    qtbot.wait(20)
+    QApplication.processEvents()
     assert value_label.wordWrap() is True
     assert value_label.text() == "诊断内容：" + full_value

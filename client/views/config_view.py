@@ -1635,14 +1635,15 @@ class ConfigView(QWidget):
             # 先确认没有已在运行的 PortCheckThread
             if self._port_check_thread is not None and self._port_check_thread.isRunning():
                 return  # 已有棢测线程在跑，跳过
-            try:
-                if self._port_check_thread is not None:
-                    self._port_check_thread.quit()
-                    self._port_check_thread.wait(500)
-            except (RuntimeError, AttributeError):
-                pass
+            if self._port_check_thread is not None:
+                self._port_check_thread = None
             self._port_check_thread = PortCheckThread(port, timeout=0.5, parent=self)
             self._port_check_thread.check_finished.connect(self._on_port_check_finished)
+            self._port_check_thread.finished.connect(
+                lambda thread=self._port_check_thread: self._clear_finished_thread(
+                    "_port_check_thread", thread
+                )
+            )
             self._port_check_thread.start()
         except (RuntimeError, AttributeError):
             pass
@@ -2771,46 +2772,35 @@ class ConfigView(QWidget):
 
     # ==================== 生命周期 ====================
 
+    def _clear_finished_thread(self, attribute: str, thread):
+        """仅在原线程 finished 后清除对应引用，避免覆盖新线程。"""
+        if getattr(self, attribute, None) is thread:
+            setattr(self, attribute, None)
+
+    def _request_thread_stop(self, attribute: str):
+        """协作式请求线程退出；运行中的线程由 finished 信号负责释放引用。"""
+        thread = getattr(self, attribute, None)
+        if thread is None:
+            return
+        try:
+            if thread.isRunning():
+                thread.quit()
+                return
+        except RuntimeError:
+            pass
+        setattr(self, attribute, None)
+
     def _cleanup_mysql_test_thread(self):
-        """清理 MySQL 测试线程（安全停止并释放资源"""
-        if self._mysql_test_thread is not None:
-            try:
-                if self._mysql_test_thread.isRunning():
-                    self._mysql_test_thread.quit()
-                    if not self._mysql_test_thread.wait(3000):
-                        self._mysql_test_thread.terminate()
-                        self._mysql_test_thread.wait(1000)
-            except RuntimeError:
-                # C++ 对象已被锢毁，安全忽略
-                pass
-            self._mysql_test_thread = None
+        """协作式请求 MySQL 测试线程退出，绝不在 GUI 线程等待或终止它。"""
+        self._request_thread_stop("_mysql_test_thread")
 
     def _cleanup_port_check_thread(self):
-        """清理端口棢测线程（安全停止并释放资源）"""
-        if self._port_check_thread is not None:
-            try:
-                if self._port_check_thread.isRunning():
-                    self._port_check_thread.quit()
-                    if not self._port_check_thread.wait(1000):
-                        self._port_check_thread.terminate()
-                        self._port_check_thread.wait(500)
-            except RuntimeError:
-                # C++ 对象已被锢毁，安全忽略
-                pass
-            self._port_check_thread = None
+        """协作式请求端口检测线程退出，finished 后才清除引用。"""
+        self._request_thread_stop("_port_check_thread")
 
     def _cleanup_ftp_test_thread(self):
-        """清理 FTP 测试线程，确保页面销毁前没有后台回调。"""
-        if self._ftp_test_thread is not None:
-            try:
-                if self._ftp_test_thread.isRunning():
-                    self._ftp_test_thread.quit()
-                    if not self._ftp_test_thread.wait(1000):
-                        self._ftp_test_thread.terminate()
-                        self._ftp_test_thread.wait(500)
-            except RuntimeError:
-                pass
-            self._ftp_test_thread = None
+        """协作式请求 FTP 测试线程退出，finished 后才清除引用。"""
+        self._request_thread_stop("_ftp_test_thread")
 
     def eventFilter(self, obj, event):
         """双击 URL 标签即可复制到剪贴板"""
@@ -2828,7 +2818,7 @@ class ConfigView(QWidget):
         self._cleanup_mysql_test_thread()
         self._cleanup_port_check_thread()
         self._cleanup_ftp_test_thread()
-        self._cleanup_web_process()
+        self._cleanup_web_process(sync_status=False)
 
     def dispose(self):
         """确定性释放页面后台资源，不触发新的状态同步或后台线程。"""
