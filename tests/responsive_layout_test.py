@@ -828,3 +828,61 @@ def test_status_tab_labels_retranslate_to_spanish(qtbot, isolated_ui_settings):
     assert view._status_tabs["mysql"].text() == "MySQL"
     assert view._status_tabs["sync"].text() == "Sincronización"
     assert view._status_tabs["ftp"].text() == "FTP"
+
+
+def test_config_view_medium_and_narrow_keep_auxiliary_controls_visible_without_rebuilding(
+    qtbot, isolated_ui_settings
+):
+    """真实离屏布局在 1000/800px 间重排既有控件，不裁切操作入口。"""
+    from PySide6.QtWidgets import QBoxLayout
+
+    view = ConfigView()
+    qtbot.addWidget(view)
+    view.resize(1000, 1100)
+    view.show()
+    QApplication.processEvents()
+
+    tracked = {
+        "db_host": view.db_host,
+        "status": view._status_panel,
+        "stats": view.card_stats,
+        "actions": view.card_actions,
+        "overview": view.card_overview,
+    }
+    assert view._responsive_mode == "medium"
+    assert view._horizontal_area.orientation() == Qt.Vertical
+    assert view._status_tab_bar.isVisible()
+    assert view._status_stack.currentWidget().isVisible()
+    assert view.card_stats.isVisible()
+    assert view.card_actions.isVisible()
+    assert view._bottom_stack.orientation() == Qt.Vertical
+    assert view._auxiliary_scroll.widget() is view._bottom_stack
+    assert view._workshop_layout.direction() == QBoxLayout.TopToBottom
+    assert all(button.isVisible() and button.height() > 0 for button in (
+        view.btn_export, view.btn_import, view.btn_clear_queue,
+    ))
+
+    view.resize(800, 1100)
+    QApplication.processEvents()
+    assert view._responsive_mode == "narrow"
+    assert view._stat_grid.columnCount() == 1
+    assert [view._stat_grid.itemAtPosition(row, 0).widget() for row in range(4)] == list(
+        view._mini_stats.values()
+    )
+    assert view.cbx_workshop.geometry().bottom() < view.btn_workshop_manage.geometry().top()
+    assert view.cbx_workshop.width() == view.btn_workshop_manage.width()
+    assert all(button.isVisible() and button.height() > 0 for button in (
+        view.btn_export, view.btn_import, view.btn_clear_queue,
+    ))
+
+    view.resize(1280, 1100)
+    QApplication.processEvents()
+    assert view._responsive_mode == "wide"
+    assert view._horizontal_area.orientation() == Qt.Horizontal
+    assert view._bottom_stack.orientation() == Qt.Horizontal
+    assert view._workshop_layout.direction() == QBoxLayout.LeftToRight
+    assert view.db_host is tracked["db_host"]
+    assert view._status_panel is tracked["status"]
+    assert view.card_stats is tracked["stats"]
+    assert view.card_actions is tracked["actions"]
+    assert view.card_overview is tracked["overview"]
