@@ -4,9 +4,9 @@ UI 状态持久化模块
 每次登录时 _auto_backup_config_on_login 会将当前 UI 状态一并写入备份；
 运行期间保存列宽时也会实时更新最新的备份文件。
 """
+import glob
 import json
 import os
-import glob
 
 
 _BACKUP_DIR = None
@@ -54,6 +54,24 @@ def _save_to_latest(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+def save_ui_preference(key: str, value):
+    """保存一个可 JSON 序列化的通用 UI 偏好。"""
+    data = _load_latest()
+    ui = data.setdefault("ui_settings", {})
+    preferences = ui.setdefault("preferences", {})
+    preferences[key] = value
+    _save_to_latest(data)
+
+
+def restore_ui_preference(key: str, default=None):
+    """恢复通用 UI 偏好；未保存或格式无效时返回默认值。"""
+    data = _load_latest()
+    preferences = data.get("ui_settings", {}).get("preferences", {})
+    if not isinstance(preferences, dict):
+        return default
+    return preferences.get(key, default)
 
 
 def save_window_geometry(geometry, state=None):
