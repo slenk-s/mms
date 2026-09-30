@@ -10,6 +10,7 @@ import configparser
 from datetime import datetime, timedelta
 import uuid
 import random
+import weakref
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,9 +23,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QThread
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QIcon, QFont, QColor
+from shiboken6 import isValid
 
 from utils.theme import apply_theme
 from utils.helpers import get_current_timestamp, generate_uuid
+from utils.ui_settings import restore_ui_preference
 from config import (
     WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
     MYSQL_HOST, MYSQL_PORT, LOCAL_DB_PATH, APP_VERSION,
@@ -479,6 +482,7 @@ class MainWindow(QMainWindow):
             self._enter_main_ui()
 
     def _init_ui(self):
+        self._navigation_auto_collapsed = False
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
@@ -544,9 +548,71 @@ class MainWindow(QMainWindow):
         self.login_view.setGeometry(self.central_widget.rect())
         self.login_view.hide()
 
+    @staticmethod
+    def _responsive_mode_for_width(width: int) -> str:
+        """根据主窗口可用宽度选择配置页的响应式布局档位。"""
+        if width >= 1400:
+            return "wide"
+        if width >= 1100:
+            return "medium"
+        return "narrow"
+
+    def _apply_responsive_layout(self, width: int):
+        """分发响应式模式，并在窄屏临时折叠导航栏。"""
+        mode = self._responsive_mode_for_width(width)
+
+        if hasattr(self, "nav_bar"):
+            if mode == "narrow":
+                if not self._navigation_auto_collapsed:
+                    # 自动折叠仅是当前窄屏的显示状态，不能覆盖用户偏好。
+                    self.nav_bar.set_collapsed(True, persist=False)
+                    self._navigation_auto_collapsed = True
+            elif self._navigation_auto_collapsed:
+                # 离开窄屏后从持久化偏好恢复，而不是沿用自动折叠状态。
+                collapsed = restore_ui_preference("navigation_collapsed", False)
+                self.nav_bar.set_collapsed(bool(collapsed), persist=False)
+                self._navigation_auto_collapsed = False
+
+        if hasattr(self, "config_view"):
+            self.config_view.set_responsive_mode(mode)
+
+    def _schedule_responsive_layout_confirmation(self, width: int):
+        """在子控件布局完成后，安全地确认主窗口断点仍为最终模式。"""
+        self._responsive_layout_revision = getattr(self, "_responsive_layout_revision", 0) + 1
+        revision = self._responsive_layout_revision
+        window_ref = weakref.ref(self)
+
+        def confirm_mode():
+            window = window_ref()
+            if window is None or not isValid(window):
+                return
+            try:
+                if getattr(window, "_responsive_layout_revision", None) != revision:
+                    return
+                central_widget = window.central_widget
+                config_view = window.config_view
+                if not isValid(central_widget) or not isValid(config_view):
+                    return
+                if central_widget.contentsRect().width() != width:
+                    return
+                mode = window._responsive_mode_for_width(width)
+                if config_view._responsive_mode != mode:
+                    config_view.set_responsive_mode(mode)
+            except RuntimeError:
+                # Qt 对象已在排队回调执行前销毁。
+                return
+
+        QTimer.singleShot(0, confirm_mode)
+
     def resizeEvent(self, event):
-        """窗口大小变化时调整登录覆盖层为全屏覆盖"""
+        """窗口大小变化时分发响应式布局并调整登录覆盖层。"""
         super().resizeEvent(event)
+        if hasattr(self, "central_widget"):
+            width = self.central_widget.contentsRect().width()
+            self._apply_responsive_layout(width)
+            # ConfigView 的既有 resizeEvent 可能在本次布局末尾按自身宽度重设模式；
+            # 排队回调只在窗口、视图有效且模式不同的情况下调用其公开接口校正。
+            self._schedule_responsive_layout_confirmation(width)
         if hasattr(self, "login_view") and self.login_view.isVisible():
             # 覆盖整个窗口（含状态栏）
             self.login_view.setGeometry(0, 0, self.width(), self.height())

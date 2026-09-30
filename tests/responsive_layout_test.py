@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
-from main import MainWindow
-from views.config_view import _FtpTestThread
 
 
 CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
@@ -17,6 +15,8 @@ if str(CLIENT_DIR) not in sys.path:
     sys.path.insert(0, str(CLIENT_DIR))
 
 from i18n import tr, translations
+from main import MainWindow
+from views.config_view import _FtpTestThread
 from utils import ui_settings
 from widgets.navigation import NavigationBar
 from views.config_view import ConfigView, StatusCard
@@ -135,6 +135,93 @@ def test_ui_preference_returns_default_without_saved_value(isolated_ui_settings)
     assert ui_settings.restore_ui_preference("unknown_preference", "default") == "default"
 
 
+
+def test_main_window_responsive_layout_uses_real_offscreen_qt():
+    """真实离屏 Qt 验证主窗口断点、导航偏好恢复及登录覆盖层几何。"""
+    script = textwrap.dedent(
+        """
+        import tempfile
+        from PySide6.QtCore import QRect
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
+        from main import MainWindow
+        from utils import ui_settings
+        from views.config_view import ConfigView
+        from widgets.navigation import NavigationBar
+
+        app = QApplication([])
+        ui_settings._BACKUP_DIR = tempfile.mkdtemp()
+
+        def settle_layout():
+            app.processEvents()
+            QTest.qWait(1)
+            app.processEvents()
+        window = MainWindow.__new__(MainWindow)
+        QMainWindow.__init__(window)
+        window._navigation_auto_collapsed = False
+
+        window.central_widget = QWidget()
+        window.setCentralWidget(window.central_widget)
+        main_layout = QHBoxLayout(window.central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        window.nav_bar = NavigationBar()
+        main_layout.addWidget(window.nav_bar)
+        window.content_area = QWidget()
+        content_layout = QVBoxLayout(window.content_area)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        window.config_view = ConfigView()
+        content_layout.addWidget(window.config_view)
+        main_layout.addWidget(window.content_area)
+        window.login_view = QWidget(window.central_widget)
+        window.login_view.hide()
+        window.resize(1400, 900)
+        window.show()
+        settle_layout()
+
+        assert window._responsive_mode_for_width(1400) == "wide"
+        assert window._responsive_mode_for_width(1399) == "medium"
+        assert window._responsive_mode_for_width(1099) == "narrow"
+        for width, expected_mode in ((1400, "wide"), (1399, "medium"), (1099, "narrow")):
+            window.resize(width, 900)
+            settle_layout()
+            assert window.central_widget.contentsRect().width() == width
+            assert window.config_view._responsive_mode == expected_mode
+
+        window.resize(1400, 900)
+        settle_layout()
+        window.nav_bar.set_collapsed(False)
+        window.resize(1099, 900)
+        settle_layout()
+        assert window.nav_bar.is_collapsed() is True
+        assert window._navigation_auto_collapsed is True
+        assert ui_settings.restore_ui_preference("navigation_collapsed", True) is False
+        window.resize(1400, 900)
+        settle_layout()
+        assert window.nav_bar.is_collapsed() is False
+        assert window._navigation_auto_collapsed is False
+
+        window.login_view.show()
+        window.resize(1099, 760)
+        settle_layout()
+        assert window.login_view.geometry() == QRect(0, 0, window.width(), window.height())
+
+        window.login_view.hide()
+        assert window.config_view.shutdown_for_application_exit(5000)
+        window.config_view.dispose()
+        window.close()
+        app.processEvents()
+        """
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(CLIENT_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        timeout=20, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 def test_config_view_reflows_existing_containers_without_recreating_controls(visible_config_view):
     """三档模式只重排容器，保留已经创建的表单和状态控件。"""
