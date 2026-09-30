@@ -26,6 +26,7 @@ from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
 from i18n import tr
 from widgets.toast import toast_success, toast_error, toast_info, toast_warning
 from utils.dialogs import show_confirm
+from utils.ui_settings import save_ui_preference, restore_ui_preference
 from utils.credential_manager import get_password
 from config import (
     APP_VERSION, APP_MODE, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, DEFAULT_WORKSHOP,
@@ -647,6 +648,7 @@ class ConfigView(QWidget):
         # 手风琴模式：连接扢有分组的展开信号，同丢时间只展弢丢
         for grp in self._config_groups.values():
             grp.expanded_changed.connect(self._on_group_expanded)
+        self._restore_card_accordion_defaults()
 
         self._scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -733,6 +735,22 @@ class ConfigView(QWidget):
         # 车间切换区域
         self._init_workshop_selector()
 
+        # 状态区与辅助区均采用独立单选展开的卡片组，避免同时展开造成空白与裁切。
+        self._status_groups = {}
+        self._aux_groups = {}
+        self._install_card_accordion(
+            self._right_layout,
+            self._status_groups,
+            "config_status_card",
+            [
+                ("overview", tr("config.card_overview"), "database", self.card_overview),
+                ("mysql", tr("config.card_mysql"), "sync", self.card_mysql),
+                ("sync", tr("config.card_sync"), "alert", self.card_sync),
+                ("ftp", tr("config.card_ftp"), "web_query", self.card_ftp),
+            ],
+            "overview",
+        )
+
         self._right_layout.addStretch()
         self._horizontal_area.addWidget(self._status_panel)
         self._horizontal_area.setStretchFactor(0, 3)
@@ -744,8 +762,21 @@ class ConfigView(QWidget):
         self._bottom_stack = QSplitter(Qt.Horizontal)
         self._bottom_stack.setChildrenCollapsible(False)
         self._bottom_stack.setMinimumSize(0, 0)
-        self._bottom_stack.addWidget(self.card_stats)
-        self._bottom_stack.addWidget(self.card_actions)
+        self._aux_panel = QWidget()
+        self._aux_layout = QVBoxLayout(self._aux_panel)
+        self._aux_layout.setContentsMargins(0, 0, 0, 0)
+        self._aux_layout.setSpacing(10)
+        self._install_card_accordion(
+            self._aux_layout,
+            self._aux_groups,
+            "config_aux_card",
+            [
+                ("stats", tr("config.card_stats"), "hardware", self.card_stats),
+                ("actions", tr("config.card_actions"), "update", self.card_actions),
+            ],
+            "stats",
+        )
+        self._bottom_stack.addWidget(self._aux_panel)
         self._bottom_stack.setStretchFactor(0, 1)
         self._bottom_stack.setStretchFactor(1, 1)
         # 保留旧属性，兼容既有内部访问。
@@ -753,6 +784,45 @@ class ConfigView(QWidget):
         self._outer_layout.addWidget(self._bottom_stack, stretch=0)
         self.set_responsive_mode(self._responsive_mode)
 
+    def _install_card_accordion(self, layout, groups: dict, preference_key: str, entries: list, default_key: str):
+        """将既有卡片放入同一区域单选展开容器，不重建业务控件。"""
+        saved = restore_ui_preference(preference_key, default_key)
+        keys = {entry[0] for entry in entries}
+        selected = saved if saved in keys else default_key
+        for key, title, group_type, card in entries:
+            group = ConfigGroup(title, group_type)
+            group.content_layout().addWidget(card)
+            group.set_expanded(key == selected)
+            group.expanded_changed.connect(
+                lambda source, expanded, k=key, g=groups, pref=preference_key: self._on_card_group_expanded(g, pref, source, expanded)
+            )
+            groups[key] = group
+            layout.addWidget(group)
+
+    def _on_card_group_expanded(self, groups: dict, preference_key: str, source, expanded: bool):
+        if not expanded:
+            # 该区域至少保留一个可见内容，避免用户误以为卡片丢失。
+            if not any(group._expanded for group in groups.values()):
+                source.set_expanded(True)
+            return
+        for group in groups.values():
+            if group is not source:
+                group.set_expanded(False)
+        for key, group in groups.items():
+            if group is source:
+                save_ui_preference(preference_key, key)
+                break
+
+    def _restore_card_accordion_defaults(self):
+        """首次默认展开数据库配置、概览和数据统计；已有偏好优先。"""
+        self._select_config_group(restore_ui_preference("config_group", "database"))
+
+    def _select_config_group(self, key: str):
+        if key not in self._config_groups:
+            key = "database"
+        for name, group in self._config_groups.items():
+            group.set_expanded(name == key)
+        save_ui_preference("config_group", key)
     def set_responsive_mode(self, mode: str):
         """按模式重排既有容器，不重新创建任何配置表单或状态卡。"""
         if mode not in {"wide", "medium", "narrow"}:
@@ -821,9 +891,11 @@ class ConfigView(QWidget):
         """??????????????????????"""
         if not is_expanded:
             return
-        for grp in self._config_groups.values():
+        for name, grp in self._config_groups.items():
             if grp is not group:
                 grp.set_expanded(False)
+            else:
+                save_ui_preference("config_group", name)
 
     # ==================== 表单构建（与 v2.2 丢致）====================
 
