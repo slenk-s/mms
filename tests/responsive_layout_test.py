@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QBoxLayout
 
 
 CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
@@ -221,6 +221,47 @@ def test_config_view_reflows_existing_containers_without_recreating_controls(vis
     view.set_responsive_mode("wide")
     assert status_panel.parentWidget() is view._horizontal_area
     assert view.db_host is db_host
+
+
+def test_config_view_reflows_stats_and_workshop_controls_at_all_breakpoints(
+    visible_config_view,
+):
+    """三断点保持辅助卡片对象不变，并按要求排列统计和车间控件。"""
+    view = visible_config_view
+    mini_stats = tuple(view._mini_stats.values())
+    action_buttons = (view.btn_export, view.btn_import, view.btn_clear_queue)
+    workshop_controls = (
+        view.lbl_workshop,
+        view.cbx_workshop,
+        view.btn_workshop_manage,
+    )
+
+    expectations = (
+        ("wide", 1250, Qt.Horizontal, Qt.Horizontal, 2, QBoxLayout.LeftToRight),
+        ("medium", 900, Qt.Vertical, Qt.Vertical, 2, QBoxLayout.LeftToRight),
+        ("narrow", 800, Qt.Vertical, Qt.Vertical, 1, QBoxLayout.TopToBottom),
+    )
+    for mode, width, area_orientation, bottom_orientation, columns, workshop_orientation in expectations:
+        view.resize(width, 900)
+        view.set_responsive_mode(mode)
+        QApplication.processEvents()
+        view.card_actions.adjustSize()
+        QApplication.processEvents()
+
+        assert view._horizontal_area.orientation() == area_orientation
+        assert view._bottom_stack.orientation() == bottom_orientation
+        assert view._stat_grid.columnCount() == columns
+        assert view._workshop_layout.direction() == workshop_orientation
+        assert tuple(view._mini_stats.values()) == mini_stats
+        assert all(button.isVisible() and button.height() > 0 for button in action_buttons)
+        assert all(control.isVisible() and control.height() > 0 for control in workshop_controls)
+
+        if mode == "narrow":
+            control_rects = [control.geometry() for control in workshop_controls]
+            assert all(
+                first.bottom() < second.top()
+                for first, second in zip(control_rects, control_rects[1:])
+            )
 
 def test_config_view_keeps_complete_config_and_status_content_across_breakpoints_offscreen():
     """Python 3.11 离屏环境中，三档布局始终保留完整可访问的配置与状态内容。"""

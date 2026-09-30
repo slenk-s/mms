@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
-    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout,
+    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout, QBoxLayout,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
@@ -781,13 +781,46 @@ class ConfigView(QWidget):
             self._status_panel.setMaximumWidth(16777215)
             self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
             self._bottom_stack.setOrientation(Qt.Horizontal)
-            if mode == "wide":
-                self._horizontal_area.setSizes([900, 320])
-            else:
-                self._horizontal_area.setSizes([760, 260])
+            self._horizontal_area.setSizes([900, 320])
 
+        self._set_stat_grid_columns(1 if mode == "narrow" else 2)
+        self._workshop_layout.setDirection(
+            QBoxLayout.TopToBottom if mode == "narrow" else QBoxLayout.LeftToRight
+        )
+        self._workshop_layout.invalidate()
+        self.card_actions.layout().invalidate()
+        self.card_actions.layout().activate()
+        self.card_actions.updateGeometry()
+        self._bottom_stack.updateGeometry()
+        self._outer_layout.invalidate()
+        self._outer_layout.activate()
         self._responsive_mode = mode
         self._refresh_status_value_displays()
+
+    def _set_stat_grid_columns(self, columns: int):
+        """在不重建迷你统计卡片的前提下调整统计网格列数。"""
+        positions = [
+            self._stat_grid.getItemPosition(index)
+            for index in range(self._stat_grid.count())
+        ]
+        if self._stat_grid.columnCount() == columns and all(
+            column == index % columns
+            for index, (_row, column, _row_span, _column_span) in enumerate(positions)
+        ):
+            return
+
+        old_grid = self._stat_grid
+        while old_grid.count():
+            old_grid.takeAt(0)
+        self.card_stats.body().removeItem(old_grid)
+        old_grid.deleteLater()
+
+        self._stat_grid = QGridLayout()
+        self._stat_grid.setSpacing(8)
+        self._stat_grid.setContentsMargins(0, 0, 0, 0)
+        for index, card in enumerate(self._mini_stats.values()):
+            self._stat_grid.addWidget(card, index // columns, index % columns)
+        self.card_stats.body().addLayout(self._stat_grid)
 
     def _refresh_status_value_displays(self):
         for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
@@ -2972,7 +3005,8 @@ class ConfigView(QWidget):
         sep.setStyleSheet("background-color: #e5e7eb; max-height: 1px;")
         self.card_actions.body().addWidget(sep)
 
-        ws_layout = QHBoxLayout()
+        self._workshop_layout = QHBoxLayout()
+        ws_layout = self._workshop_layout
         ws_layout.setSpacing(6)
 
         self.lbl_workshop = QLabel(tr("workshop.select"))
