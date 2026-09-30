@@ -18,10 +18,10 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
-    QApplication, QDialog, QListWidget, QListWidgetItem,
+    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
-from PySide6.QtGui import QFont, QGuiApplication, QColor
+from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
 
 from i18n import tr
 from widgets.toast import toast_success, toast_error, toast_info, toast_warning
@@ -255,14 +255,14 @@ class ConfigGroup(QFrame):
 
 
 class StatusCard(QFrame):
-    """???????????v2.3 ???"""
+    """用于展示状态信息的卡片，状态值会在空间不足时安全省略。"""
 
     def __init__(self, title: str, icon: str, accent_color: str, parent=None):
         super().__init__(parent)
-        self._accent = accent_color
         self._icon = icon
         self._title = title
         self._rows = {}  # 缓存行控件引用，避免重建
+        self._value_rows = {}
         self._init_ui(title, icon, accent_color)
 
     def _init_ui(self, title: str, icon: str, accent_color: str):
@@ -277,7 +277,6 @@ class StatusCard(QFrame):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        # 标题
         header = QHBoxLayout()
         header.setSpacing(6)
         self._title_lbl = QLabel(f"{icon} {title}")
@@ -287,7 +286,6 @@ class StatusCard(QFrame):
         header.addStretch()
         layout.addLayout(header)
 
-        # 分割
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet("color: #e5e7eb;")
@@ -298,20 +296,17 @@ class StatusCard(QFrame):
         layout.addLayout(self._body_layout)
 
     def set_title(self, title: str):
+        self._title = title
         self._title_lbl.setText(f"{self._icon} {title}")
 
     def set_row(self, row_id: str, label: str, value: str, value_color: str = "#1f2937"):
-        """???????????????????"""
+        """设置或更新普通标签/值行，而不重建已有标签。"""
         safe_label = label or ""
         safe_value = value or ""
         if row_id in self._rows:
-            # 更新已有
-            lbl, val = self._rows[row_id]
+            lbl, val_lbl = self._rows[row_id]
             lbl.setText(safe_label)
-            val.setText(safe_value)
-            val.setStyleSheet(f"color: {value_color}; font-size: 12px; font-weight: bold;")
         else:
-            # 创建新行
             row = QHBoxLayout()
             row.setSpacing(8)
 
@@ -320,60 +315,117 @@ class StatusCard(QFrame):
             lbl.setStyleSheet("color: #6b7280; font-size: 12px;")
             lbl.setWordWrap(False)
 
-            val_lbl = QLabel(safe_value)
+            val_lbl = QLabel()
             val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val_lbl.setStyleSheet(f"color: {value_color}; font-size: 12px; font-weight: bold;")
-            val_lbl.setWordWrap(False)
-
+            val_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             row.addWidget(lbl)
             row.addWidget(val_lbl, 1)
             self._body_layout.addLayout(row)
             self._rows[row_id] = (lbl, val_lbl)
+            self._value_rows[row_id] = {"label": val_lbl, "text": "", "wrap": False}
+
+        val_lbl.setStyleSheet(
+            f"color: {value_color}; font-size: 12px; font-weight: bold;"
+        )
+        self.set_value(row_id, safe_value)
+
+    def set_value(self, row_id: str, text: str, wrap: bool = False):
+        """更新值并保留完整文本；非换行值被省略时提供完整 Tooltip。"""
+        if row_id not in self._value_rows:
+            raise KeyError(f"Unknown value row: {row_id}")
+
+        entry = self._value_rows[row_id]
+        entry["text"] = text or ""
+        entry["wrap"] = wrap
+        self._refresh_value_label(entry)
+
+    def _refresh_value_label(self, entry):
+        value_label = entry["label"]
+        full_text = entry["text"]
+        if entry["wrap"]:
+            if not value_label.wordWrap():
+                value_label.setWordWrap(True)
+            if value_label.text() != full_text:
+                value_label.setText(full_text)
+            if value_label.toolTip():
+                value_label.setToolTip("")
+            return
+
+        if value_label.wordWrap():
+            value_label.setWordWrap(False)
+        available_width = value_label.contentsRect().width()
+        if available_width <= 0:
+            available_width = value_label.width()
+        if available_width <= 0:
+            displayed_text = full_text
+        else:
+            displayed_text = QFontMetrics(value_label.font()).elidedText(
+                full_text, Qt.ElideRight, available_width
+            )
+        tooltip = full_text if displayed_text != full_text else ""
+        if value_label.text() != displayed_text:
+            value_label.setText(displayed_text)
+        if value_label.toolTip() != tooltip:
+            value_label.setToolTip(tooltip)
+
+    def refresh_value_display(self):
+        """在卡片尺寸或父布局改变后重新计算所有可省略状态值。"""
+        for entry in self._value_rows.values():
+            self._refresh_value_label(entry)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.refresh_value_display()
 
     def set_status_row(self, row_id: str, status_text: str, is_online: bool):
-        """设置或更新带圆点指示器的状行"""
+        """设置或更新带圆点指示器的状态行。"""
         safe_text = status_text or ""
+        dot = "🟢" if is_online else "🔴"
+        color = "#059669" if is_online else "#dc2626"
+        text = f"{dot} {safe_text}"
         if row_id in self._rows:
             val = self._rows[row_id]
-            dot = "\U0001f7e2" if is_online else "\U0001f534"
-            color = "#059669" if is_online else "#dc2626"
-            val.setText(f"{dot} {safe_text}")
-            val.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: bold;")
+            val.setText(text)
         else:
             row = QHBoxLayout()
             row.setSpacing(6)
-
-            dot = "\U0001f7e2" if is_online else "\U0001f534"
-            color = "#059669" if is_online else "#dc2626"
-            lbl = QLabel(f"{dot} {safe_text}")
-            lbl.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: bold;")
-            row.addWidget(lbl)
+            val = QLabel(text)
+            row.addWidget(val)
             row.addStretch()
             self._body_layout.addLayout(row)
-            self._rows[row_id] = lbl
+            self._rows[row_id] = val
+        val.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: bold;")
+        val.setToolTip(text)
 
     def set_error_row(self, row_id: str, text: str):
-        """设置或更新错误提示行"""
+        """设置或更新可换行的错误/诊断提示行。"""
         err_prefix = tr("config.error_prefix")
         safe_text = text or ""
+        displayed_text = f"{err_prefix}{safe_text}"
         if row_id in self._rows:
-            self._rows[row_id].setText(f"{err_prefix}{safe_text}")
+            lbl = self._rows[row_id]
+            lbl.setText(displayed_text)
         else:
-            lbl = QLabel(f"{err_prefix}{safe_text}")
+            lbl = QLabel(displayed_text)
             lbl.setWordWrap(True)
             lbl.setStyleSheet("color: #dc2626; font-size: 11px;")
             self._body_layout.addWidget(lbl)
             self._rows[row_id] = lbl
+        lbl.setWordWrap(True)
+        lbl.setToolTip(displayed_text)
 
     def clear_row(self, row_id: str):
-        """?????"""
+        """删除缓存的行控件引用。"""
+        self._value_rows.pop(row_id, None)
         if row_id in self._rows:
             widget = self._rows.pop(row_id)
             if hasattr(widget, 'deleteLater'):
                 widget.deleteLater()
 
     def get_row_value(self, row_id: str) -> str:
-        """????????????"""
+        """返回值行的完整文本，避免调用方读到显示省略号。"""
+        if row_id in self._value_rows:
+            return self._value_rows[row_id]["text"]
         if row_id not in self._rows:
             return ""
         widget = self._rows[row_id]
@@ -382,7 +434,7 @@ class StatusCard(QFrame):
         return widget.text()
 
     def body(self):
-        """返回内部 body 布局，供外部添加自定义控布局"""
+        """返回内部 body 布局，供外部添加自定义控件布局。"""
         return self._body_layout
 
 
@@ -487,20 +539,20 @@ class ConfigView(QWidget):
 
     def _init_ui(self):
         # 外层使用垂直布局，便于窄屏时在下方插入同步状态和快捷操作
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(16, 16, 16, 16)
-        outer_layout.setSpacing(12)
+        self._outer_layout = QVBoxLayout(self)
+        self._outer_layout.setContentsMargins(16, 16, 16, 16)
+        self._outer_layout.setSpacing(12)
+        self._responsive_mode = "wide"
 
-        # 水平区域：左侧配置表+ 右侧状面板（宽屏模式
-        self._horizontal_area = QWidget()
+        # 宽/中等模式由 splitter 分配主配置区与状态区，主配置区优先。
+        self._horizontal_area = QSplitter(Qt.Horizontal)
+        self._horizontal_area.setChildrenCollapsible(False)
         self._horizontal_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        h_layout = QHBoxLayout(self._horizontal_area)
-        h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(16)
 
         # ==================== 左侧：配置表====================
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
+        self._config_panel = QWidget()
+        self._config_panel.setMinimumWidth(620)
+        left_layout = QVBoxLayout(self._config_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
@@ -574,12 +626,15 @@ class ConfigView(QWidget):
         scroll.setWidget(scroll_content)
         left_layout.addWidget(scroll)
 
-        h_layout.addWidget(left_widget, stretch=7)
+        self._horizontal_area.addWidget(self._config_panel)
 
         # ==================== 右侧：状态面====================
-        self._right_widget = QWidget()
-        self._right_widget.setFixedWidth(320)
-        self._right_layout = QVBoxLayout(self._right_widget)
+        self._status_panel = QWidget()
+        self._status_panel.setMinimumWidth(240)
+        self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        # 保留旧属性，兼容既有内部访问。
+        self._right_widget = self._status_panel
+        self._right_layout = QVBoxLayout(self._status_panel)
         self._right_layout.setContentsMargins(0, 0, 0, 0)
         self._right_layout.setSpacing(12)
 
@@ -653,18 +708,59 @@ class ConfigView(QWidget):
         self._init_workshop_selector()
 
         self._right_layout.addStretch()
-        h_layout.addWidget(self._right_widget, stretch=0)
+        self._horizontal_area.addWidget(self._status_panel)
+        self._horizontal_area.setStretchFactor(0, 3)
+        self._horizontal_area.setStretchFactor(1, 1)
 
-        outer_layout.addWidget(self._horizontal_area, stretch=1)
+        self._outer_layout.addWidget(self._horizontal_area, stretch=1)
 
-        # ==================== 底部区域（数据统+ 快捷操作，两列布屢====================
-        self._bottom_area = QWidget()
-        bottom_layout = QHBoxLayout(self._bottom_area)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_layout.setSpacing(12)
-        bottom_layout.addWidget(self.card_stats, stretch=1)
-        bottom_layout.addWidget(self.card_actions, stretch=1)
-        outer_layout.addWidget(self._bottom_area, stretch=0)
+        # 统计与快捷操作也复用同一组卡片，仅改变 splitter 的方向。
+        self._bottom_stack = QSplitter(Qt.Horizontal)
+        self._bottom_stack.setChildrenCollapsible(False)
+        self._bottom_stack.addWidget(self.card_stats)
+        self._bottom_stack.addWidget(self.card_actions)
+        self._bottom_stack.setStretchFactor(0, 1)
+        self._bottom_stack.setStretchFactor(1, 1)
+        # 保留旧属性，兼容既有内部访问。
+        self._bottom_area = self._bottom_stack
+        self._outer_layout.addWidget(self._bottom_stack, stretch=0)
+        self.set_responsive_mode(self._responsive_mode)
+
+    def set_responsive_mode(self, mode: str):
+        """按模式重排既有容器，不重新创建任何配置表单或状态卡。"""
+        if mode not in {"wide", "medium", "narrow"}:
+            raise ValueError("responsive mode must be one of: wide, medium, narrow")
+
+        if mode == "narrow":
+            # 保持两个面板始终属于同一 splitter，只切换方向，避免 QWidget
+            # 在 QSplitter 与普通布局之间重设父对象导致的销毁顺序问题。
+            self._horizontal_area.setOrientation(Qt.Vertical)
+            self._status_panel.setMinimumWidth(0)
+            self._status_panel.setMaximumWidth(16777215)
+            self._status_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            self._horizontal_area.setSizes([700, 360])
+            self._bottom_stack.setOrientation(Qt.Vertical)
+        else:
+            self._horizontal_area.setOrientation(Qt.Horizontal)
+            self._status_panel.setMinimumWidth(240)
+            self._status_panel.setMaximumWidth(16777215)
+            self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            self._bottom_stack.setOrientation(Qt.Horizontal)
+            if mode == "wide":
+                self._horizontal_area.setSizes([900, 320])
+            else:
+                self._horizontal_area.setSizes([760, 260])
+
+        self._responsive_mode = mode
+        self._refresh_status_value_displays()
+
+    def _refresh_status_value_displays(self):
+        for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
+            card.refresh_value_display()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_status_value_displays()
 
     # ==================== 手风琴模====================
 
