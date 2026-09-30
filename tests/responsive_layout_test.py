@@ -9,9 +9,18 @@ CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
 if str(CLIENT_DIR) not in sys.path:
     sys.path.insert(0, str(CLIENT_DIR))
 
-from i18n import tr
+from i18n import tr, translations
 from utils import ui_settings
 from widgets.navigation import NavigationBar
+
+
+@pytest.fixture(autouse=True)
+def temporary_language():
+    """在内存中固定测试语言，且不写入语言偏好文件。"""
+    previous_language = translations.get_current()
+    translations.set_current("zh_CN")
+    yield
+    translations.set_current(previous_language)
 
 
 @pytest.fixture
@@ -24,7 +33,7 @@ def isolated_ui_settings(monkeypatch, tmp_path):
 def test_navigation_collapses_and_expands_with_translated_tooltips(
     qtbot, isolated_ui_settings
 ):
-    """折叠隐藏文字并保留完整翻译 Tooltip，展开后恢复信息。"""
+    """折叠保留可辨识图标与翻译辅助文本，展开后恢复信息。"""
     navigation = NavigationBar()
     qtbot.addWidget(navigation)
     navigation.set_user_info("Alice", "admin")
@@ -36,8 +45,9 @@ def test_navigation_collapses_and_expands_with_translated_tooltips(
     assert 64 <= navigation.minimumWidth() <= 72
     assert 64 <= navigation.maximumWidth() <= 72
     for page_id, button in navigation._buttons.items():
-        assert button.text() == ""
+        assert button.text() == NavigationBar.NAV_ITEM_ICONS[page_id]
         assert button.toolTip() == tr(f"nav.{page_id}")
+        assert button.accessibleName() == tr(f"nav.{page_id}")
     assert navigation.logout_btn.text() == ""
     assert navigation.logout_btn.toolTip() == tr("nav.logout")
     assert navigation.user_label.isHidden()
@@ -50,9 +60,34 @@ def test_navigation_collapses_and_expands_with_translated_tooltips(
     assert 200 <= navigation.maximumWidth() <= 240
     for page_id, button in navigation._buttons.items():
         assert button.text() == tr(f"nav.{page_id}")
+        assert button.accessibleName() == tr(f"nav.{page_id}")
     assert navigation.logout_btn.text() == tr("nav.logout")
     assert navigation.user_label.text() == "👤 Alice\n[管理员]"
     assert navigation.lib_label.text() == tr("nav.local_library", name="测试库")
+
+
+def test_collapse_button_uses_translated_tooltip_and_accessible_name(
+    qtbot, isolated_ui_settings
+):
+    """折叠开关应随语言和状态更新 Tooltip 与可访问名称。"""
+    navigation = NavigationBar()
+    qtbot.addWidget(navigation)
+
+    assert navigation.collapse_button.toolTip() == tr("nav.collapse")
+    assert navigation.collapse_button.accessibleName() == tr("nav.collapse")
+
+    navigation.set_collapsed(True)
+    assert navigation.collapse_button.toolTip() == tr("nav.expand")
+    assert navigation.collapse_button.accessibleName() == tr("nav.expand")
+
+    translations.set_current("es_ES")
+    navigation.retranslate_ui()
+    assert navigation.collapse_button.toolTip() == tr("nav.expand")
+    assert navigation.collapse_button.accessibleName() == tr("nav.expand")
+    for page_id, button in navigation._buttons.items():
+        assert button.text() == NavigationBar.NAV_ITEM_ICONS[page_id]
+        assert button.toolTip() == tr(f"nav.{page_id}")
+        assert button.accessibleName() == tr(f"nav.{page_id}")
 
 
 def test_navigation_collapsed_preference_is_saved_and_restored(

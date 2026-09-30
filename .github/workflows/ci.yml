@@ -62,7 +62,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install PySide6 pymysql fastapi cython pytest PyJWT
+          pip install PySide6 pymysql fastapi cython pytest pytest-qt PyJWT
 
       - name: Build Cython extensions
         run: |

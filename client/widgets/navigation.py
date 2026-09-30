@@ -23,6 +23,13 @@ class NavigationBar(QWidget):
     COLLAPSED_WIDTH = 68
     EXPANDED_MIN_WIDTH = 200
     EXPANDED_MAX_WIDTH = 240
+    NAV_ITEM_ICONS = {
+        "inventory": "📦",
+        "register": "📝",
+        "asset": "🏷️",
+        "config": "⚙️",
+        "user_manage": "👥",
+    }
 
     page_changed = Signal(str)
     logout_clicked = Signal()
@@ -47,8 +54,8 @@ class NavigationBar(QWidget):
 
         self.collapse_button = QPushButton("☰")
         self.collapse_button.setObjectName("navCollapseButton")
-        self.collapse_button.setToolTip("折叠导航栏")
-        self.collapse_button.setAccessibleName("折叠导航栏")
+        self.collapse_button.setToolTip(tr("nav.collapse"))
+        self.collapse_button.setAccessibleName(tr("nav.collapse"))
         self.collapse_button.clicked.connect(
             lambda: self.set_collapsed(not self.is_collapsed())
         )
@@ -149,18 +156,20 @@ class NavigationBar(QWidget):
 
         for page_id, button in self._buttons.items():
             label = tr(f"nav.{page_id}")
-            button.setText("" if self._collapsed else label)
+            button.setText(
+                self.NAV_ITEM_ICONS[page_id] if self._collapsed else label
+            )
             button.setToolTip(label)
+            button.setAccessibleName(label)
 
         logout_label = tr("nav.logout")
         self.logout_btn.setText("" if self._collapsed else logout_label)
         self.logout_btn.setToolTip(logout_label)
         self.user_label.setVisible(not self._collapsed)
         self.lib_label.setVisible(not self._collapsed)
-        self.collapse_button.setToolTip(
-            "展开导航栏" if self._collapsed else "折叠导航栏"
-        )
-        self.collapse_button.setAccessibleName(self.collapse_button.toolTip())
+        toggle_label = tr("nav.expand" if self._collapsed else "nav.collapse")
+        self.collapse_button.setToolTip(toggle_label)
+        self.collapse_button.setAccessibleName(toggle_label)
 
     def _on_nav_clicked(self, page_id: str):
         """导航按钮点击事件。"""

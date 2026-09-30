@@ -51,6 +51,8 @@ TRANSLATIONS = {
     "nav.role_admin": "管理员",
     "nav.role_user": "普通用户",
     "nav.local_library": "本地库: {name}",
+    "nav.collapse": "折叠导航栏",
+    "nav.expand": "展开导航栏",
 
     # ==================== 同步状态栏 ====================
     "ssb.network_detecting": "网络: 检测中...",

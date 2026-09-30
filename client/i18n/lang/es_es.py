@@ -51,6 +51,8 @@ TRANSLATIONS = {
     "nav.role_admin": "Administrador",
     "nav.role_user": "Usuario",
     "nav.local_library": "Almacén: {name}",
+    "nav.collapse": "Contraer navegación",
+    "nav.expand": "Expandir navegación",
 
     # ==================== Barra de Estado ====================
     "ssb.network_detecting": "Red: Detectando...",
