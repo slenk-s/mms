@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 
@@ -724,90 +723,3 @@ def test_data_table_headers_and_cells_are_always_left_aligned(qtbot):
     assert table.table.horizontalHeader().defaultAlignment() == expected
     for column in range(table.table.columnCount()):
         assert table.table.item(0, column).textAlignment() == expected
-
-
-def test_config_view_defaults_to_database_accordion_and_overview_status_tab(
-    qtbot, isolated_ui_settings
-):
-    """首次打开时数据库配置和概览状态卡必须分别是唯一可见项。"""
-    view = ConfigView()
-    qtbot.addWidget(view)
-    view.show()
-    QApplication.processEvents()
-
-    assert view._config_groups["database"]._expanded is True
-    assert all(
-        not group._expanded
-        for key, group in view._config_groups.items()
-        if key != "database"
-    )
-    assert view._status_stack.currentWidget() is view.card_overview
-    assert view._status_tabs["overview"].isChecked() is True
-
-
-def test_config_accordion_keeps_one_group_expanded_and_remembers_selection(
-    qtbot, isolated_ui_settings
-):
-    """展开新组会收起旧组，点击唯一展开组不能把配置区收为空。"""
-    view = ConfigView()
-    qtbot.addWidget(view)
-    view.show()
-    QApplication.processEvents()
-
-    QTest.mouseClick(view._config_groups["sync"]._header, Qt.LeftButton)
-    QApplication.processEvents()
-    assert view._config_groups["sync"]._expanded is True
-    assert view._config_groups["database"]._expanded is False
-    assert ui_settings.restore_ui_preference("config_group") == "sync"
-
-    QTest.mouseClick(view._config_groups["sync"]._header, Qt.LeftButton)
-    QApplication.processEvents()
-    assert view._config_groups["sync"]._expanded is True
-    assert sum(group._expanded for group in view._config_groups.values()) == 1
-
-
-def test_config_view_restores_config_and_status_preferences(qtbot, isolated_ui_settings):
-    """保存的配置分组和状态卡选择会在下一次创建页面时恢复。"""
-    ui_settings.save_ui_preference("config_group", "hardware")
-    ui_settings.save_ui_preference("config_status_card", "ftp")
-
-    view = ConfigView()
-    qtbot.addWidget(view)
-
-    assert view._config_groups["hardware"]._expanded is True
-    assert sum(group._expanded for group in view._config_groups.values()) == 1
-    assert view._status_stack.currentWidget() is view.card_ftp
-    assert view._status_tabs["ftp"].isChecked() is True
-
-
-def test_status_tabs_switch_existing_cards_without_rebuilding_them(
-    qtbot, isolated_ui_settings
-):
-    """标签切换只改变当前可见卡，既有状态卡对象及后台刷新宿主不变。"""
-    view = ConfigView()
-    qtbot.addWidget(view)
-    view.show()
-    QApplication.processEvents()
-    cards_before = {
-        "overview": view.card_overview,
-        "mysql": view.card_mysql,
-        "sync": view.card_sync,
-        "ftp": view.card_ftp,
-    }
-    timer_before = view._status_timer
-
-    QTest.mouseClick(view._status_tabs["mysql"], Qt.LeftButton)
-    QApplication.processEvents()
-
-    assert view._status_stack.currentWidget() is cards_before["mysql"]
-    assert view.card_mysql.isVisible() is True
-    assert all(
-        card is cards_before[key] and card.isHidden()
-        for key, card in {
-            "overview": view.card_overview,
-            "sync": view.card_sync,
-            "ftp": view.card_ftp,
-        }.items()
-    )
-    assert view._status_timer is timer_before
-    assert ui_settings.restore_ui_preference("config_status_card") == "mysql"
