@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
     QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout,
-    QStackedWidget, QBoxLayout,
+    QStackedWidget,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
@@ -672,8 +672,7 @@ class ConfigView(QWidget):
 
         # 卡片 1：系统概
         self._status_tabs = {}
-        self._status_tab_bar = QWidget()
-        status_tab_bar = self._status_tab_bar
+        status_tab_bar = QWidget()
         status_tab_layout = QHBoxLayout(status_tab_bar)
         status_tab_layout.setContentsMargins(0, 0, 0, 0)
         status_tab_layout.setSpacing(4)
@@ -763,19 +762,16 @@ class ConfigView(QWidget):
         self.card_actions = StatusCard(tr("config.card_actions"), "⚡", "#ec4899")
         self.btn_export = QPushButton(tr("config.btn_export"))
         self.btn_export.setStyleSheet(BTN_SECONDARY.replace("padding: 8px 16px", "padding: 6px 12px"))
-        self.btn_export.setMinimumHeight(32)
         self.btn_export.clicked.connect(self._export_config)
         self.card_actions.body().addWidget(self.btn_export)
 
         self.btn_import = QPushButton(tr("config.btn_import"))
         self.btn_import.setStyleSheet(BTN_SECONDARY.replace("padding: 8px 16px", "padding: 6px 12px"))
-        self.btn_import.setMinimumHeight(32)
         self.btn_import.clicked.connect(self._import_config)
         self.card_actions.body().addWidget(self.btn_import)
 
         self.btn_clear_queue = QPushButton(tr("config.btn_clear_queue"))
         self.btn_clear_queue.setStyleSheet(BTN_DANGER)
-        self.btn_clear_queue.setMinimumHeight(32)
         self.btn_clear_queue.clicked.connect(self._clear_sync_queue)
         self.card_actions.body().addWidget(self.btn_clear_queue)
 
@@ -796,16 +792,9 @@ class ConfigView(QWidget):
         self._bottom_stack.addWidget(self.card_actions)
         self._bottom_stack.setStretchFactor(0, 1)
         self._bottom_stack.setStretchFactor(1, 1)
-        # 保留旧属性，兼容既有内部访问。辅助区可在有限高度内滚动，
-        # 统计和快捷操作卡始终保留在 splitter 中而不会折叠或重建。
+        # 保留旧属性，兼容既有内部访问。
         self._bottom_area = self._bottom_stack
-        self._auxiliary_scroll = QScrollArea()
-        self._auxiliary_scroll.setWidgetResizable(True)
-        self._auxiliary_scroll.setFrameShape(QFrame.NoFrame)
-        self._auxiliary_scroll.setMinimumSize(0, 0)
-        self._auxiliary_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._auxiliary_scroll.setWidget(self._bottom_stack)
-        self._outer_layout.addWidget(self._auxiliary_scroll, stretch=0)
+        self._outer_layout.addWidget(self._bottom_stack, stretch=0)
         self.set_responsive_mode(self._responsive_mode)
 
     def set_responsive_mode(self, mode: str):
@@ -813,8 +802,7 @@ class ConfigView(QWidget):
         if mode not in {"wide", "medium", "narrow"}:
             raise ValueError("responsive mode must be one of: wide, medium, narrow")
 
-        is_compact = mode in {"medium", "narrow"}
-        if is_compact:
+        if mode in {"medium", "narrow"}:
             # 内容区不足以并排承载配置与状态时，状态区下移并纵向排列。
             # 保持两个面板始终属于同一 splitter，只切换方向，避免 QWidget
             # 在 QSplitter 与普通布局之间重设父对象导致的销毁顺序问题。
@@ -824,11 +812,7 @@ class ConfigView(QWidget):
             self._status_panel.setMaximumWidth(16777215)
             self._status_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             self._horizontal_area.setSizes([700, 360])
-            # 统计和快捷操作常驻于可滚动辅助区，彼此纵向完整排列。
             self._bottom_stack.setOrientation(Qt.Vertical)
-            self._workshop_layout.setDirection(QBoxLayout.TopToBottom)
-            self.cbx_workshop.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.btn_workshop_manage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         else:
             self._horizontal_area.setOrientation(Qt.Horizontal)
             self._config_panel.setMinimumWidth(620)
@@ -836,33 +820,13 @@ class ConfigView(QWidget):
             self._status_panel.setMaximumWidth(16777215)
             self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
             self._bottom_stack.setOrientation(Qt.Horizontal)
-            self._workshop_layout.setDirection(QBoxLayout.LeftToRight)
-            self.cbx_workshop.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.btn_workshop_manage.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            self._horizontal_area.setSizes([900, 320])
+            if mode == "wide":
+                self._horizontal_area.setSizes([900, 320])
+            else:
+                self._horizontal_area.setSizes([760, 260])
 
-        self._set_stat_grid_columns(1 if mode == "narrow" else 2)
         self._responsive_mode = mode
         self._refresh_status_value_displays()
-
-    def _set_stat_grid_columns(self, columns: int):
-        """重排既有统计卡片；仅替换网格布局，不创建新的统计卡片。"""
-        current_columns = getattr(self, "_stat_grid_columns", 2)
-        if current_columns != columns:
-            old_grid = self._stat_grid
-            self.card_stats.body().removeItem(old_grid)
-            while old_grid.count():
-                old_grid.takeAt(0)
-            old_grid.setParent(None)
-            self._stat_grid = QGridLayout()
-            self._stat_grid.setSpacing(8)
-            self._stat_grid.setContentsMargins(0, 0, 0, 0)
-            self.card_stats.body().addLayout(self._stat_grid)
-
-        for index, mini in enumerate(self._mini_stats.values()):
-            row, column = divmod(index, columns)
-            self._stat_grid.addWidget(mini, row, column)
-        self._stat_grid_columns = columns
 
     def _refresh_status_value_displays(self):
         for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
@@ -3087,8 +3051,7 @@ class ConfigView(QWidget):
         sep.setStyleSheet("background-color: #e5e7eb; max-height: 1px;")
         self.card_actions.body().addWidget(sep)
 
-        self._workshop_layout = QBoxLayout(QBoxLayout.LeftToRight)
-        ws_layout = self._workshop_layout
+        ws_layout = QHBoxLayout()
         ws_layout.setSpacing(6)
 
         self.lbl_workshop = QLabel(tr("workshop.select"))
