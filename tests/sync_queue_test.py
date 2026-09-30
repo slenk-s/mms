@@ -276,3 +276,116 @@ def test_atomic_shared_table_change_and_queue_use_one_transaction(local_db: Loca
 
     assert local_db.query(TABLE_USERS, "id = ?", ("atomic-user",))[0]["username"] == "atomic-user"
     assert local_db.get_sync_queue(limit=10)[0]["operation_id"] == "atomic-shared-user"
+
+
+
+def test_shared_outbox_and_business_write_roll_back_in_one_public_database_transaction(local_db: LocalDB):
+    """共享表写入失败时，公共 outbox 与业务表必须一起回滚。"""
+    shared_path = Path(local_db._shared_db_path)
+    with sqlite3.connect(shared_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO shared_sync_queue (
+                operation_id, table_name, operation, record_id, payload, status,
+                attempt_count, status_updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
+            """,
+            ("shared-duplicate", TABLE_USERS, "INSERT", "existing-user", "{}", "2026-09-30T10:00:00"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        local_db.apply_local_change_with_sync(
+            TABLE_USERS,
+            "INSERT",
+            "rolled-back-user",
+            {"id": "rolled-back-user", "username": "rolled-back-user", "password": "secret"},
+            {"id": "rolled-back-user", "username": "rolled-back-user"},
+            operation_id="shared-duplicate",
+        )
+
+    assert local_db.query(TABLE_USERS, "id = ?", ("rolled-back-user",)) == []
+    with sqlite3.connect(shared_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM shared_sync_queue WHERE record_id = ?", ("rolled-back-user",)
+        ).fetchone()[0] == 0
+
+
+def test_existing_shared_queue_entries_migrate_to_public_outbox_without_loss(tmp_path: Path):
+    db_path = tmp_path / "legacy-shared.db"
+    first = LocalDB(str(db_path), workshop="测试车间")
+    try:
+        first.enqueue_sync_operation(
+            TABLE_USERS, "UPDATE", "legacy-user", {"id": "legacy-user"}, operation_id="legacy-shared-op"
+        )
+    finally:
+        first.close_all()
+
+    db = LocalDB(str(db_path), workshop="测试车间")
+    try:
+        with sqlite3.connect(db_path) as workshop_conn:
+            assert workshop_conn.execute(
+                "SELECT COUNT(*) FROM sync_queue WHERE operation_id = ?", ("legacy-shared-op",)
+            ).fetchone()[0] == 0
+        with sqlite3.connect(db._shared_db_path) as shared_conn:
+            row = shared_conn.execute(
+                "SELECT operation_id, table_name, status FROM shared_sync_queue WHERE operation_id = ?",
+                ("legacy-shared-op",),
+            ).fetchone()
+        assert row == ("legacy-shared-op", TABLE_USERS, "pending")
+        assert [item["operation_id"] for item in db.get_sync_queue()] == ["legacy-shared-op"]
+    finally:
+        db.close_all()
+
+
+def test_unified_queue_claims_and_confirms_workshop_and_shared_operations(local_db: LocalDB):
+    local_db.enqueue_sync_operation(
+        TABLE_MATERIALS, "UPDATE", "workshop-row", {"id": "workshop-row"}, operation_id="workshop-op"
+    )
+    local_db.enqueue_sync_operation(
+        TABLE_USERS, "UPDATE", "shared-row", {"id": "shared-row"}, operation_id="shared-op"
+    )
+
+    claimed = local_db.claim_sync_batch(limit=10, now="2026-09-30T10:00:00")
+    assert {item["operation_id"] for item in claimed} == {"workshop-op", "shared-op"}
+    assert len({item["batch_id"] for item in claimed}) == 1
+    assert local_db.get_pending_record_ids(TABLE_USERS) == {"shared-row"}
+    for item in claimed:
+        assert local_db.mark_sync_succeeded(item["operation_id"], item["batch_id"])
+    assert local_db.get_sync_queue_count() == 0
+
+
+def test_operation_id_is_unique_across_workshop_and_shared_queues(local_db: LocalDB):
+    local_db.enqueue_sync_operation(
+        TABLE_MATERIALS, "UPDATE", "workshop-row", {"id": "workshop-row"}, operation_id="global-operation-id"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        local_db.apply_local_change_with_sync(
+            TABLE_USERS,
+            "INSERT",
+            "global-id-user",
+            {"id": "global-id-user", "username": "global-id-user", "password": "secret"},
+            {"id": "global-id-user", "username": "global-id-user"},
+            operation_id="global-operation-id",
+        )
+
+    assert local_db.query(TABLE_USERS, "id = ?", ("global-id-user",)) == []
+
+
+
+def test_shared_outbox_protects_public_table_during_full_replace(local_db: LocalDB):
+    local_db.apply_local_change_with_sync(
+        TABLE_USERS,
+        "INSERT",
+        "local-pending-user",
+        {"id": "local-pending-user", "username": "local-pending-user", "password": "secret"},
+        {"id": "local-pending-user", "username": "local-pending-user"},
+        operation_id="public-pending-op",
+    )
+
+    local_db.replace_table_transactional(TABLE_USERS, [{
+        "id": "cloud-user", "username": "cloud-user", "password": "cloud-secret",
+    }])
+
+    users = {user["id"] for user in local_db.query(TABLE_USERS)}
+    assert users == {"local-pending-user", "cloud-user"}

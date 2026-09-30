@@ -231,11 +231,11 @@ class LocalDB:
         self._conn_pool: Dict[int, sqlite3.Connection] = {}
         self._pool_lock = threading.Lock()
         self._init_db()
-        self.recover_in_progress_operations()
         self._shared_db_path = os.path.join(os.path.dirname(db_path), "local_cache_common.db")
         self._shared_conn_pool: Dict[int, sqlite3.Connection] = {}
         self._shared_init_db()
         self._migrate_shared_from_workshop_db()
+        self.recover_in_progress_operations()
 
     def _shared_init_db(self):
         conn = sqlite3.connect(self._shared_db_path, timeout=5.0)
@@ -275,12 +275,13 @@ class LocalDB:
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_employee_card ON {_q(TABLE_EMPLOYEE_RECORDS)}(card_no)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_employee_fingerprint ON {_q(TABLE_EMPLOYEE_RECORDS)}(fingerprint_id)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_employee_no ON {_q(TABLE_EMPLOYEE_RECORDS)}(employee_no)")
+            self._create_sync_queue(cursor, "shared_sync_queue", "idx_shared_sync_queue")
             conn.commit()
         finally:
             conn.close()
 
     def _migrate_shared_from_workshop_db(self):
-        """首次切换车间时，将车间库中的用户/员工数据迁移到公共库，避免数据丢失"""
+        """迁移旧车间库中的共享表和共享表 outbox，复制成功后才删除旧队列项。"""
         try:
             src = sqlite3.connect(self.db_path, timeout=5.0)
             src.row_factory = sqlite3.Row
@@ -299,15 +300,33 @@ class LocalDB:
                     if not rows:
                         continue
                     keys = list(rows[0].keys())
-                    placeholders = ", ".join(f"{k}" for k in keys)
+                    columns = ", ".join(keys)
                     qmarks = ", ".join(["?"] * len(keys))
-                    for r in rows:
+                    for record in rows:
                         dst.execute(
-                            f"INSERT OR IGNORE INTO {_q(table)} ({placeholders}) VALUES ({qmarks})",
-                            tuple(r[k] for k in keys),
+                            f"INSERT OR IGNORE INTO {_q(table)} ({columns}) VALUES ({qmarks})",
+                            tuple(record[key] for key in keys),
                         )
                     _log.info("从车间库迁移 %s %d 条记录到公共库", table, len(rows))
+
+                legacy_items = src.execute(
+                    "SELECT * FROM sync_queue WHERE table_name IN (?, ?)", tuple(SHARED_TABLES)
+                ).fetchall()
+                for item in legacy_items:
+                    columns = list(item.keys())
+                    dst.execute(
+                        f"INSERT OR IGNORE INTO shared_sync_queue ({', '.join(columns)}) "
+                        f"VALUES ({', '.join('?' for _ in columns)})",
+                        tuple(item[column] for column in columns),
+                    )
+                # 先提交公共库副本，再清理旧项；清理失败最多是可去重副本，绝不丢失操作。
                 dst.commit()
+                if legacy_items:
+                    src.executemany(
+                        "DELETE FROM sync_queue WHERE operation_id = ?",
+                        [(item["operation_id"],) for item in legacy_items],
+                    )
+                    src.commit()
             finally:
                 src.close()
                 dst.close()
@@ -540,26 +559,7 @@ class LocalDB:
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_employee_fingerprint ON {_q(TABLE_EMPLOYEE_RECORDS)}(fingerprint_id)")
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_employee_no ON {_q(TABLE_EMPLOYEE_RECORDS)}(employee_no)")
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS sync_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation_id TEXT NOT NULL UNIQUE,
-                    table_name TEXT NOT NULL,
-                    operation TEXT NOT NULL CHECK(operation IN ('INSERT','UPDATE','DELETE')),
-                    record_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    retry_count INTEGER DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK(status IN ('pending', 'in_progress', 'retryable', 'succeeded', 'failed')),
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    next_retry_at TEXT,
-                    batch_id TEXT,
-                    status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            self._migrate_sync_queue_state_machine(cursor)
+            self._create_sync_queue(cursor, "sync_queue", "idx_sync_queue")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sync_log (
@@ -608,62 +608,69 @@ class LocalDB:
                 (hash_password("admin"),)
             )
 
-    def _migrate_sync_queue_state_machine(self, cursor):
-        """为旧版 sync_queue 补齐可恢复状态机字段。"""
-        existing_columns = {
-            row[1] for row in cursor.execute("PRAGMA table_info(sync_queue)")
-        }
+    def _create_sync_queue(self, cursor, queue_table: str, index_prefix: str):
+        """创建或升级一个可恢复同步队列；公共 outbox 与共享业务库同库。"""
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_q(queue_table)} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id TEXT NOT NULL UNIQUE,
+                table_name TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK(operation IN ('INSERT','UPDATE','DELETE')),
+                record_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                retry_count INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'in_progress', 'retryable', 'succeeded', 'failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_retry_at TEXT,
+                batch_id TEXT,
+                status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self._migrate_sync_queue_state_machine(cursor, queue_table, index_prefix)
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS {index_prefix}_claim "
+            f"ON {_q(queue_table)}(status, next_retry_at, created_at)"
+        )
+
+    def _migrate_sync_queue_state_machine(self, cursor, queue_table: str = "sync_queue",
+                                          index_prefix: str = "idx_sync_queue"):
+        """为旧版同步队列补齐可恢复状态机字段。"""
+        existing_columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({_q(queue_table)})")}
         new_columns = [
-            ("operation_id", "TEXT"),
-            ("status", "TEXT DEFAULT 'pending'"),
-            ("attempt_count", "INTEGER DEFAULT 0"),
-            ("last_error", "TEXT"),
-            ("next_retry_at", "TEXT"),
-            ("batch_id", "TEXT"),
+            ("operation_id", "TEXT"), ("status", "TEXT DEFAULT 'pending'"),
+            ("attempt_count", "INTEGER DEFAULT 0"), ("last_error", "TEXT"),
+            ("next_retry_at", "TEXT"), ("batch_id", "TEXT"),
             ("status_updated_at", "TEXT"),
         ]
         for column_name, column_type in new_columns:
             if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE sync_queue ADD COLUMN {column_name} {column_type}"
-                )
-
+                cursor.execute(f"ALTER TABLE {_q(queue_table)} ADD COLUMN {column_name} {column_type}")
         cursor.execute(
-            """
-            UPDATE sync_queue
-            SET operation_id = 'legacy-' || id
-            WHERE operation_id IS NULL OR operation_id = ''
-            """
+            f"UPDATE {_q(queue_table)} SET operation_id = 'legacy-' || id "
+            "WHERE operation_id IS NULL OR operation_id = ''"
         )
         cursor.execute(
-            """
-            UPDATE sync_queue
-            SET status = 'pending'
-            WHERE status IS NULL OR status = ''
-            """
+            f"UPDATE {_q(queue_table)} SET status = 'pending' "
+            "WHERE status IS NULL OR status = ''"
         )
         if "attempt_count" not in existing_columns:
-            cursor.execute(
-                "UPDATE sync_queue SET attempt_count = COALESCE(retry_count, 0)"
-            )
+            cursor.execute(f"UPDATE {_q(queue_table)} SET attempt_count = COALESCE(retry_count, 0)")
         else:
             cursor.execute(
-                """
-                UPDATE sync_queue
-                SET attempt_count = COALESCE(attempt_count, retry_count, 0)
-                WHERE attempt_count IS NULL
-                """
+                f"UPDATE {_q(queue_table)} SET attempt_count = COALESCE(attempt_count, retry_count, 0) "
+                "WHERE attempt_count IS NULL"
             )
         cursor.execute(
-            """
-            UPDATE sync_queue
-            SET status_updated_at = COALESCE(status_updated_at, created_at, CURRENT_TIMESTAMP)
-            WHERE status_updated_at IS NULL OR status_updated_at = ''
-            """
+            f"UPDATE {_q(queue_table)} SET status_updated_at = "
+            "COALESCE(status_updated_at, created_at, CURRENT_TIMESTAMP) "
+            "WHERE status_updated_at IS NULL OR status_updated_at = ''"
         )
         cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_queue_operation_id "
-            "ON sync_queue(operation_id)"
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {index_prefix}_operation_id "
+            f"ON {_q(queue_table)}(operation_id)"
         )
 
     def _migrate_borrow_records_v19(self, cursor):
@@ -1018,22 +1025,44 @@ class LocalDB:
 
     # ---------- 同步队列 ----------
 
+    def _queue_connections(self):
+        """统一暴露车间队列与公共 outbox；调用方无需感知数据来源。"""
+        return (
+            ("workshop", "sync_queue", self._connect),
+            ("shared", "shared_sync_queue", self._shared_connect),
+        )
+
+    @staticmethod
+    def _with_queue_source(rows, source: str) -> List[Dict]:
+        return [{**dict(row), "_queue_source": source} for row in rows]
+
+    def _assert_operation_id_available(self, operation_id: str, exclude_source: Optional[str] = None) -> None:
+        """在另一库检查 operation_id，避免跨两个 outbox 的标识冲突。"""
+        for source, queue_table, connect in self._queue_connections():
+            if source == exclude_source:
+                continue
+            with connect() as conn:
+                if conn.execute(
+                    f"SELECT 1 FROM {_q(queue_table)} WHERE operation_id = ?", (operation_id,)
+                ).fetchone():
+                    raise sqlite3.IntegrityError(f"重复的同步 operation_id: {operation_id}")
+
     def apply_local_change_with_sync(self, table: str, operation: str,
                                      record_id: str, data: Dict[str, Any],
                                      payload: Dict[str, Any],
                                      operation_id: Optional[str] = None) -> int:
-        """在同一 SQLite 事务中写入本地业务数据和同步队列。"""
+        """在业务表所属数据库中，与对应 outbox 同一事务提交。"""
         _validate_table(table)
         if operation not in {"INSERT", "UPDATE", "DELETE"}:
             raise ValueError(f"不支持的本地同步操作: {operation}")
         operation_id = operation_id or str(uuid.uuid4())
         payload_json = json.dumps(payload, ensure_ascii=False)
-
         if table in SHARED_TABLES:
             return self._apply_shared_change_with_sync(
                 table, operation, record_id, data, payload_json, operation_id,
             )
 
+        self._assert_operation_id_available(operation_id, exclude_source="workshop")
         conn = self._get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1050,26 +1079,21 @@ class LocalDB:
     def _apply_shared_change_with_sync(self, table: str, operation: str,
                                        record_id: str, data: Dict[str, Any],
                                        payload_json: str, operation_id: str) -> int:
-        """共享表通过附加车间库，在一个 SQLite 事务中写入同步队列。"""
+        """共享表和 shared_sync_queue 同库同事务，绝不依赖 ATTACH/WAL 跨库原子性。"""
+        self._assert_operation_id_available(operation_id, exclude_source="shared")
         conn = self._shared_get_conn()
-        attached = False
         try:
-            conn.execute("ATTACH DATABASE ? AS sync_queue_db", (self.db_path,))
-            attached = True
             conn.execute("BEGIN IMMEDIATE")
             self._execute_local_change(conn, table, operation, record_id, data)
             queue_id = self._enqueue_sync_operation(
                 conn, table, operation, record_id, payload_json, operation_id,
-                queue_table="sync_queue_db.sync_queue",
+                queue_table="shared_sync_queue",
             )
             conn.commit()
             return queue_id
         except Exception:
             conn.rollback()
             raise
-        finally:
-            if attached:
-                conn.execute("DETACH DATABASE sync_queue_db")
 
     def _execute_local_change(self, conn: sqlite3.Connection, table: str,
                               operation: str, record_id: str,
@@ -1101,17 +1125,15 @@ class LocalDB:
                                 operation: str, record_id: str,
                                 payload_json: str, operation_id: str,
                                 queue_table: str = "sync_queue") -> int:
-        sql = f"""
-            INSERT INTO {queue_table} (
+        return conn.execute(
+            f"""
+            INSERT INTO {_q(queue_table)} (
                 operation_id, table_name, operation, record_id, payload, status,
                 attempt_count, status_updated_at
             ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)
-        """
-        params = (
-            operation_id, table_name, operation, record_id, payload_json,
-            datetime.now().isoformat(),
-        )
-        return conn.execute(sql, params).lastrowid
+            """,
+            (operation_id, table_name, operation, record_id, payload_json, datetime.now().isoformat()),
+        ).lastrowid
 
     def add_sync_queue(self, table_name: str, operation: str,
                        record_id: str, payload: Dict) -> None:
@@ -1122,35 +1144,30 @@ class LocalDB:
                                record_id: str, payload: Dict,
                                operation_id: Optional[str] = None,
                                conn: Optional[sqlite3.Connection] = None) -> int:
-        """写入一条 pending 操作；传入 conn 时由调用方控制同一事务。"""
+        """入队到业务表所属 outbox；operation_id 在两个队列范围内唯一。"""
         operation_id = operation_id or str(uuid.uuid4())
         payload_json = json.dumps(payload, ensure_ascii=False)
         if conn is not None:
+            self._assert_operation_id_available(operation_id, exclude_source="workshop")
+            return self._enqueue_sync_operation(conn, table_name, operation, record_id, payload_json, operation_id)
+        source = "shared" if table_name in SHARED_TABLES else "workshop"
+        queue_table = "shared_sync_queue" if source == "shared" else "sync_queue"
+        self._assert_operation_id_available(operation_id, exclude_source=source)
+        connect = self._shared_connect if source == "shared" else self._connect
+        with connect() as own_conn:
             return self._enqueue_sync_operation(
-                conn, table_name, operation, record_id, payload_json, operation_id,
-            )
-        with self._connect() as own_conn:
-            return self._enqueue_sync_operation(
-                own_conn, table_name, operation, record_id, payload_json, operation_id,
+                own_conn, table_name, operation, record_id, payload_json, operation_id, queue_table,
             )
 
-    def claim_sync_batch(self, limit: int = 50, now: Optional[str] = None,
-                         batch_id: Optional[str] = None) -> List[Dict]:
-        """原子领取 pending 或已到期 retryable 操作并标记为 in_progress。"""
-        limit = _validate_numeric(limit, "同步领取数量")
-        if limit == 0:
+    def _claim_queue_batch(self, source: str, queue_table: str, connect, limit: int,
+                           now: str, batch_id: str) -> List[Dict]:
+        if limit <= 0:
             return []
-        now = now or datetime.now().isoformat()
-        batch_id = batch_id or str(uuid.uuid4())
-        eligible = (
-            "(status = 'pending' OR (status = 'retryable' "
-            "AND (next_retry_at IS NULL OR next_retry_at <= ?)))"
-        )
-        with self._connect() as conn:
+        eligible = "(status = 'pending' OR (status = 'retryable' AND (next_retry_at IS NULL OR next_retry_at <= ?)))"
+        with connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                f"SELECT id FROM sync_queue WHERE {eligible} "
-                "ORDER BY created_at, id LIMIT ?",
+                f"SELECT id FROM {_q(queue_table)} WHERE {eligible} ORDER BY created_at, id LIMIT ?",
                 (now, limit),
             ).fetchall()
             if not rows:
@@ -1158,145 +1175,157 @@ class LocalDB:
             ids = [row["id"] for row in rows]
             placeholders = ", ".join("?" for _ in ids)
             conn.execute(
-                f"UPDATE sync_queue SET status = 'in_progress', batch_id = ?, "
-                f"status_updated_at = ? WHERE id IN ({placeholders}) AND {eligible}",
+                f"UPDATE {_q(queue_table)} SET status = 'in_progress', batch_id = ?, status_updated_at = ? "
+                f"WHERE id IN ({placeholders}) AND {eligible}",
                 (batch_id, now, *ids, now),
             )
             claimed = conn.execute(
-                f"SELECT * FROM sync_queue WHERE id IN ({placeholders}) "
+                f"SELECT * FROM {_q(queue_table)} WHERE id IN ({placeholders}) "
                 "AND status = 'in_progress' AND batch_id = ? ORDER BY created_at, id",
                 (*ids, batch_id),
             ).fetchall()
-            return [dict(row) for row in claimed]
+            return self._with_queue_source(claimed, source)
+
+    def claim_sync_batch(self, limit: int = 50, now: Optional[str] = None,
+                         batch_id: Optional[str] = None) -> List[Dict]:
+        """统一原子领取两个 outbox 中的待处理项，并使用同一 batch_id。"""
+        limit = _validate_numeric(limit, "同步领取数量")
+        if limit == 0:
+            return []
+        now = now or datetime.now().isoformat()
+        batch_id = batch_id or str(uuid.uuid4())
+        claimed = []
+        for source, queue_table, connect in self._queue_connections():
+            claimed.extend(self._claim_queue_batch(source, queue_table, connect, limit - len(claimed), now, batch_id))
+            if len(claimed) >= limit:
+                break
+        return claimed
+
+    def _update_queue_item(self, sql_template: str, params: tuple) -> bool:
+        updated = 0
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                result = conn.execute(sql_template.format(queue_table=_q(queue_table)), params)
+                updated += result.rowcount
+        return updated == 1
 
     def mark_sync_succeeded(self, operation_id: str, batch_id: str) -> bool:
-        """仅确认属于当前领取批次的 in_progress 操作。"""
         now = datetime.now().isoformat()
-        with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE sync_queue
-                SET status = 'succeeded', batch_id = NULL, last_error = NULL,
-                    next_retry_at = NULL, status_updated_at = ?
-                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
-                """,
-                (now, operation_id, batch_id),
-            )
-            return result.rowcount == 1
+        return self._update_queue_item(
+            "UPDATE {queue_table} SET status = 'succeeded', batch_id = NULL, last_error = NULL, "
+            "next_retry_at = NULL, status_updated_at = ? "
+            "WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'",
+            (now, operation_id, batch_id),
+        )
 
     def mark_sync_retryable(self, operation_id: str, batch_id: str, error: str,
                             next_retry_at: Optional[str] = None,
                             max_attempts: int = 3) -> bool:
-        """记录可重试失败；达到上限时将操作标记为 failed。"""
         max_attempts = _validate_numeric(max_attempts, "最大重试次数")
         if max_attempts == 0:
             raise ValueError("最大重试次数必须至少为 1")
         now = datetime.now().isoformat()
         retry_at = next_retry_at or now
-        with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE sync_queue
-                SET attempt_count = attempt_count + 1,
-                    last_error = ?,
-                    status = CASE WHEN attempt_count + 1 >= ?
-                                  THEN 'failed' ELSE 'retryable' END,
-                    next_retry_at = CASE WHEN attempt_count + 1 >= ?
-                                         THEN NULL ELSE ? END,
-                    batch_id = NULL,
-                    status_updated_at = ?
-                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
-                """,
-                (error, max_attempts, max_attempts, retry_at, now, operation_id, batch_id),
-            )
-            if result.rowcount != 1:
-                return False
-            row = conn.execute(
-                "SELECT status FROM sync_queue WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            return row["status"] == "retryable"
+        updated = self._update_queue_item(
+            "UPDATE {queue_table} SET attempt_count = attempt_count + 1, last_error = ?, "
+            "status = CASE WHEN attempt_count + 1 >= ? THEN 'failed' ELSE 'retryable' END, "
+            "batch_id = NULL, next_retry_at = CASE WHEN attempt_count + 1 >= ? THEN NULL ELSE ? END, "
+            "status_updated_at = ? WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'",
+            (error, max_attempts, max_attempts, retry_at, now, operation_id, batch_id),
+        )
+        if not updated:
+            return False
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                row = conn.execute(
+                    f"SELECT status FROM {_q(queue_table)} WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+            if row:
+                return row["status"] == "retryable"
+        return False
 
     def mark_sync_failed(self, operation_id: str, batch_id: str, error: str) -> bool:
-        """将当前批次中的 in_progress 操作条件更新为 failed。"""
         now = datetime.now().isoformat()
-        with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE sync_queue
-                SET status = 'failed', batch_id = NULL, last_error = ?,
-                    next_retry_at = NULL, status_updated_at = ?
-                WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'
-                """,
-                (error, now, operation_id, batch_id),
-            )
-            return result.rowcount == 1
+        return self._update_queue_item(
+            "UPDATE {queue_table} SET status = 'failed', batch_id = NULL, last_error = ?, "
+            "next_retry_at = NULL, status_updated_at = ? "
+            "WHERE operation_id = ? AND batch_id = ? AND status = 'in_progress'",
+            (error, now, operation_id, batch_id),
+        )
 
     def recover_in_progress_operations(self, now: Optional[str] = None) -> int:
-        """启动恢复时把遗留 in_progress 操作重新置为可领取状态。"""
         now = now or datetime.now().isoformat()
-        with self._connect() as conn:
-            result = conn.execute(
-                """
-                UPDATE sync_queue
-                SET status = 'retryable', batch_id = NULL, next_retry_at = ?,
-                    status_updated_at = ?
-                WHERE status = 'in_progress'
-                """,
-                (now, now),
-            )
-            return result.rowcount
+        recovered = 0
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                recovered += conn.execute(
+                    f"UPDATE {_q(queue_table)} SET status = 'retryable', batch_id = NULL, next_retry_at = ?, "
+                    "status_updated_at = ? WHERE status = 'in_progress'",
+                    (now, now),
+                ).rowcount
+        return recovered
 
     def get_sync_queue(self, limit: int = 50) -> List[Dict]:
-        sql = "SELECT * FROM sync_queue ORDER BY created_at LIMIT ?"
-        with self._connect() as conn:
-            cursor = conn.execute(sql, (limit,))
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+        limit = _validate_numeric(limit, "同步队列查询数量")
+        rows = []
+        for source, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                rows.extend(self._with_queue_source(conn.execute(
+                    f"SELECT * FROM {_q(queue_table)} ORDER BY created_at, id LIMIT ?", (limit,)
+                ).fetchall(), source))
+        rows.sort(key=lambda item: (item.get("created_at") or "", item["_queue_source"], item["id"]))
+        return rows[:limit]
 
     def remove_sync_queue(self, queue_id: int) -> None:
-        sql = "DELETE FROM sync_queue WHERE id = ?"
-        with self._connect() as conn:
-            conn.execute(sql, (queue_id,))
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                conn.execute(f"DELETE FROM {_q(queue_table)} WHERE id = ?", (queue_id,))
 
     def increment_retry(self, queue_id: int) -> None:
-        sql = "UPDATE sync_queue SET retry_count = retry_count + 1 WHERE id = ?"
-        with self._connect() as conn:
-            conn.execute(sql, (queue_id,))
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                conn.execute(f"UPDATE {_q(queue_table)} SET retry_count = retry_count + 1 WHERE id = ?", (queue_id,))
 
     def get_sync_queue_count(self, statuses: Optional[Set[str]] = None) -> int:
-        """返回指定状态的同步项数；默认只统计仍需处理的项目。"""
         statuses = statuses or {"pending", "retryable", "in_progress"}
         placeholders = ", ".join("?" for _ in statuses)
-        sql = f"SELECT COUNT(*) as count FROM sync_queue WHERE status IN ({placeholders})"
-        with self._connect() as conn:
-            cursor = conn.execute(sql, tuple(statuses))
-            return cursor.fetchone()["count"]
+        total = 0
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                total += conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {_q(queue_table)} WHERE status IN ({placeholders})", tuple(statuses)
+                ).fetchone()["count"]
+        return total
 
     def get_sync_queue_counts(self) -> Dict[str, int]:
-        """按状态返回队列计数，供同步诊断使用。"""
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) as count FROM sync_queue GROUP BY status"
-            ).fetchall()
-        return {row["status"]: row["count"] for row in rows}
+        counts: Dict[str, int] = {}
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM {_q(queue_table)} GROUP BY status").fetchall()
+            for row in rows:
+                counts[row["status"]] = counts.get(row["status"], 0) + row["count"]
+        return counts
 
     def get_sync_queue_item(self, queue_id: int) -> Optional[Dict]:
-        sql = "SELECT * FROM sync_queue WHERE id = ?"
-        with self._connect() as conn:
-            cursor = conn.execute(sql, (queue_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        for source, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                row = conn.execute(f"SELECT * FROM {_q(queue_table)} WHERE id = ?", (queue_id,)).fetchone()
+            if row:
+                return self._with_queue_source([row], source)[0]
+        return None
 
     def get_pending_record_ids(self, table: str) -> set:
-        """获取指定表中待同步的记录ID集合（防止云端覆盖本地未上传的修改）"""
-        sql = """
-            SELECT record_id FROM sync_queue
-            WHERE table_name = ? AND status IN ('pending', 'retryable', 'in_progress')
-        """
-        with self._connect() as conn:
-            cursor = conn.execute(sql, (table,))
-            return {row["record_id"] for row in cursor.fetchall()}
+        """公共 outbox 也参与 pull 覆盖保护。"""
+        pending_ids = set()
+        for _, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                rows = conn.execute(
+                    f"SELECT record_id FROM {_q(queue_table)} WHERE table_name = ? "
+                    "AND status IN ('pending', 'retryable', 'in_progress')",
+                    (table,),
+                ).fetchall()
+            pending_ids.update(row["record_id"] for row in rows)
+        return pending_ids
 
     def replace_table_transactional(self, table: str, records: List[Dict]) -> None:
         _validate_table(table)
@@ -1305,7 +1334,7 @@ class LocalDB:
             return
         # 保护待同步记录，防止全量同步覆盖本地未上传的修改
         pending_ids = self.get_pending_record_ids(table)
-        with self._connect() as conn:
+        with (self._shared_connect() if table in SHARED_TABLES else self._connect()) as conn:
             if table in WORKSHOP_TABLES:
                 ws_clause = f"workshop = {repr(self._workshop)}"
                 if pending_ids:

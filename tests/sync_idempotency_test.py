@@ -274,3 +274,49 @@ def test_resume_auto_sync_restarts_timers_after_pause_and_stop(local_db: LocalDB
         if engine._worker_thread.isRunning():
             engine.stop()
     assert app is not None
+
+
+
+def test_paused_engine_ignores_a_health_callback_already_in_flight(local_db: LocalDB):
+    """pause 后迟到的 health 回调不得领取、推送或拉取。"""
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    claims = []
+    pushes = []
+    pulls = []
+    engine.local_db.claim_sync_batch = lambda *args, **kwargs: claims.append(True) or []
+    engine._request_push.connect(lambda items: pushes.append(items))
+    engine._start_pull = lambda: pulls.append(True)
+    try:
+        engine.start()
+        engine.pause_auto_sync()
+        assert engine.state == engine.PAUSED
+
+        # 模拟 pause 前已发出、但 pause 后才送达主线程的 Worker health 信号。
+        engine._on_worker_health(True)
+
+        assert claims == []
+        assert pushes == []
+        assert pulls == []
+    finally:
+        engine.stop()
+    assert app is not None
+
+
+def test_start_recovers_worker_and_timers_after_stop(local_db: LocalDB):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    engine._sync_cycle = lambda: None
+    try:
+        engine.stop()
+        assert engine.state == engine.STOPPED
+        assert not engine._worker_thread.isRunning()
+
+        engine.start()
+        assert engine.state == engine.RUNNING
+        assert engine._worker_thread.isRunning()
+        assert engine._timer is not None and engine._timer.isActive()
+        assert engine._full_sync_timer is not None and engine._full_sync_timer.isActive()
+    finally:
+        engine.stop()
+    assert app is not None

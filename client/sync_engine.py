@@ -105,7 +105,7 @@ class SyncWorker(QObject):
     """
 
     # 结果信号（Worker → Engine，跨线程安全）
-    health_result = Signal(bool)                 # 网络是否可达
+    health_result = Signal(bool, int)            # 网络是否可达、请求序号
     push_result = Signal(object, int, str)       # results, total_pushed, error
     pull_result = Signal(str, object, str)      # table, records, error
     full_sync_result = Signal(str, object, str)  # table, records, error
@@ -127,20 +127,20 @@ class SyncWorker(QObject):
 
     # ---------- 槽函数：由 Engine 通过信号触发（跨线程） ----------
 
-    @Slot()
-    def check_health(self):
-        """检测网络及 MySQL 连通性（后台线程执行，不阻塞主线程）"""
+    @Slot(int)
+    def check_health(self, request_id: int):
+        """检测网络及 MySQL 连通性（后台线程执行，不阻塞主线程）。"""
         self._ensure_init()
         try:
             self._mysql._ensure_conn()  # 尝试建立/恢复连接
             ok = self._mysql.health_check()
-            self.health_result.emit(ok)
+            self.health_result.emit(ok, request_id)
         except (RuntimeError, OSError, ValueError) as e:
             _log.warning("健康检查失败: %s", e)
-            self.health_result.emit(False)
+            self.health_result.emit(False, request_id)
         except Exception as e:
             _log.warning("健康检查未预期异常: %s", e)
-            self.health_result.emit(False)
+            self.health_result.emit(False, request_id)
 
     @Slot(list)
     def push_items(self, queue_items: list):
@@ -334,8 +334,12 @@ class SyncEngine(QObject):
     STATUS_OFFLINE = "offline"
     STATUS_SYNCING = "syncing"
 
+    STOPPED = "stopped"
+    PAUSED = "paused"
+    RUNNING = "running"
+
     # 内部调度信号（Engine → Worker，跨线程）
-    _request_health_check = Signal()
+    _request_health_check = Signal(int)
     _request_push = Signal(object)
     _request_pull = Signal(str, str, str)
     _request_full_sync = Signal(str, str)
@@ -347,7 +351,12 @@ class SyncEngine(QObject):
         self.local_db = local_db
         self._workshop = workshop or ""
         self._sync_status: str = self.STATUS_OFFLINE
+        self._state: str = self.STOPPED
+        # 保持旧 UI/调用方兼容：暂停仍属于已启动但禁用自动同步的状态。
         self._is_running: bool = False
+        self._next_health_request_id = 0
+        self._allowed_health_requests: Dict[int, bool] = {}
+        self._force_sync_requested = False
         self._sync_interval_seconds = SYNC_INTERVAL_SECONDS
         self._full_sync_interval_minutes = FULL_SYNC_INTERVAL_MINUTES
         self._sync_batch_size = SYNC_BATCH_SIZE
@@ -377,7 +386,7 @@ class SyncEngine(QObject):
         self._request_pull.connect(self._worker.pull_table)
         self._request_full_sync.connect(self._worker.full_sync_table)
 
-        self._worker_thread.start()
+        # STOPPED 状态不启动 Worker；start/resume 统一负责启动与计时器恢复。
 
         # 同步流程控制状态
         self._pull_table_index = 0
@@ -401,6 +410,11 @@ class SyncEngine(QObject):
     def sync_status(self) -> str:
         return self._sync_status
 
+    @property
+    def state(self) -> str:
+        """同步调度状态：STOPPED、PAUSED 或 RUNNING。"""
+        return self._state
+
     def set_conflict_callback(self, callback: Callable):
         self._on_conflict_callback = callback
 
@@ -415,35 +429,8 @@ class SyncEngine(QObject):
             self._timer.start(self._sync_interval_seconds * 1000)
         if self._full_sync_timer and self._full_sync_timer.isActive():
             self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
-    def start(self):
-        if self._is_running:
-            return
-        self._is_running = True
-        recovered = self.local_db.recover_in_progress_operations()
-        if recovered:
-            _log.info("恢复 %d 条中断的同步操作", recovered)
-        if self._timer is None:
-            self._timer = QTimer(self)
-            self._timer.timeout.connect(self._sync_cycle)
-        self._timer.start(self._sync_interval_seconds * 1000)
-        if self._full_sync_timer is None:
-            self._full_sync_timer = QTimer(self)
-            self._full_sync_timer.timeout.connect(self._full_sync)
-        self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
-        self._sync_cycle()
 
-    def pause_auto_sync(self):
-        """暂停自动定时同步（半离线模式使用）。"""
-        self._is_running = True
-        if self._timer:
-            self._timer.stop()
-        if self._full_sync_timer:
-            self._full_sync_timer.stop()
-        self._set_status(self.STATUS_OFFLINE)
-
-    def resume_auto_sync(self):
-        """恢复自动同步；暂停或完全停止后都重新启动 Worker 和计时器。"""
-        self._is_running = True
+    def _ensure_worker_and_timers(self):
         if not self._worker_thread.isRunning():
             self._worker_thread.start()
         if self._timer is None:
@@ -454,18 +441,46 @@ class SyncEngine(QObject):
             self._full_sync_timer = QTimer(self)
             self._full_sync_timer.timeout.connect(self._full_sync)
         self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
+
+    def start(self):
+        """进入 RUNNING；停止后的 start 也会重启 Worker 和两个计时器。"""
+        if self._state == self.RUNNING:
+            self._ensure_worker_and_timers()
+            return
+        self._state = self.RUNNING
+        self._is_running = True
+        recovered = self.local_db.recover_in_progress_operations()
+        if recovered:
+            _log.info("恢复 %d 条中断的同步操作", recovered)
+        self._ensure_worker_and_timers()
         self._sync_cycle()
 
+    def pause_auto_sync(self):
+        """进入 PAUSED，并废弃暂停前已发出的健康检查授权。"""
+        self._state = self.PAUSED
+        self._is_running = True
+        self._allowed_health_requests.clear()
+        if self._timer:
+            self._timer.stop()
+        if self._full_sync_timer:
+            self._full_sync_timer.stop()
+        self._set_status(self.STATUS_OFFLINE)
+
+    def resume_auto_sync(self):
+        """恢复 RUNNING；暂停或完全停止后均确保 Worker、计时器已启动。"""
+        self.start()
+
     def stop(self):
-        """完全停止同步引擎（离线模式使用）。"""
+        """进入 STOPPED，停止计时器、废弃健康回调并退出 Worker。"""
+        self._state = self.STOPPED
         self._is_running = False
+        self._allowed_health_requests.clear()
         if self._timer:
             self._timer.stop()
             self._timer = None
         if self._full_sync_timer:
             self._full_sync_timer.stop()
             self._full_sync_timer = None
-        # 确保 worker 线程中的事件处理完毕后再退出
         if self._worker_thread.isRunning():
             self._worker_thread.quit()
             if not self._worker_thread.wait(5000):
@@ -480,30 +495,46 @@ class SyncEngine(QObject):
     # ---------- 同步周期调度 ----------
 
     def _sync_cycle(self):
-        """触发同步周期：先健康检查 → 推 → 拉"""
-        self._request_health_check.emit()
+        """触发健康检查；PAUSED 只允许 force_sync 创建的受控请求。"""
+        force = self._force_sync_requested
+        self._force_sync_requested = False
+        if self._state != self.RUNNING and not (force and self._state == self.PAUSED):
+            return
+        self._next_health_request_id += 1
+        request_id = self._next_health_request_id
+        self._allowed_health_requests[request_id] = force
+        self._request_health_check.emit(request_id)
 
     def refresh_pull(self):
-        """刷新专用：只拉取不推送，不依赖定时器"""
-        if not self._is_running:
+        """刷新专用：只在 RUNNING 下拉取，PAUSED 的同步入口仅 force_sync。"""
+        if self._state != self.RUNNING:
             return
         self._set_status(self.STATUS_SYNCING)
         self._start_pull()
 
-    def _on_worker_health(self, ok: bool):
-        """Worker 健康检查完成 — Qt Slot，运行在主线程"""
+    def _on_worker_health(self, ok: bool, request_id: Optional[int] = None):
+        """只接受仍获授权的 health 回调，避免 pause/stop 后迟到回调继续同步。"""
         self._assert_main_thread()
+        if request_id is None:
+            # 兼容测试/旧的直接调用；运行态以外一律不能触发同步。
+            if self._state != self.RUNNING:
+                return
+            forced = False
+        else:
+            forced = self._allowed_health_requests.pop(request_id, None)
+            if forced is None or self._state == self.STOPPED:
+                return
+            if self._state != self.RUNNING and not forced:
+                return
         if not ok:
             self._set_status(self.STATUS_OFFLINE)
             return
         self._set_status(self.STATUS_SYNCING)
-        # 先原子领取待同步队列；只确认当前批次中的 in_progress 项。
         queue = self.local_db.claim_sync_batch(self._sync_batch_size)
         if queue:
             self.sync_started.emit("push")
             self._request_push.emit(queue)
         else:
-            # 无推送，直接拉取
             self._start_pull()
 
     def _start_pull(self):
@@ -637,7 +668,9 @@ class SyncEngine(QObject):
     # ---------- 全量同步 ----------
 
     def _full_sync(self):
-        """全量同步：逐表拉取并替换本地数据"""
+        """全量同步：逐表拉取并替换本地数据。"""
+        if self._state != self.RUNNING:
+            return
         self._full_sync_pending = set(self._sync_tables)  # 跟踪未完成的表
         self._full_sync_total = 0
         self._full_sync_failed = []
@@ -785,6 +818,10 @@ class SyncEngine(QObject):
         return {"action": "merge", "merged": merged}
 
     def force_sync(self):
-        if not self._is_running:
+        """RUNNING/PAUSED 的唯一受控手工同步入口；STOPPED 下不工作。"""
+        if self._state == self.STOPPED:
             return
+        if not self._worker_thread.isRunning():
+            self._worker_thread.start()
+        self._force_sync_requested = True
         self._sync_cycle()
