@@ -811,3 +811,20 @@ def test_status_tabs_switch_existing_cards_without_rebuilding_them(
     )
     assert view._status_timer is timer_before
     assert ui_settings.restore_ui_preference("config_status_card") == "mysql"
+
+
+
+def test_status_tab_labels_retranslate_to_spanish(qtbot, isolated_ui_settings):
+    """状态标签必须使用翻译键，并在语言切换后原位刷新。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    tabs_before = dict(view._status_tabs)
+
+    translations.set_current("es_ES")
+    view.retranslate_ui()
+
+    assert view._status_tabs == tabs_before
+    assert view._status_tabs["overview"].text() == "Resumen"
+    assert view._status_tabs["mysql"].text() == "MySQL"
+    assert view._status_tabs["sync"].text() == "Sincronización"
+    assert view._status_tabs["ftp"].text() == "FTP"

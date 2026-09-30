@@ -676,9 +676,14 @@ class ConfigView(QWidget):
         status_tab_layout = QHBoxLayout(status_tab_bar)
         status_tab_layout.setContentsMargins(0, 0, 0, 0)
         status_tab_layout.setSpacing(4)
-        for key, label in (("overview", "概览"), ("mysql", "MySQL"),
-                           ("sync", "同步"), ("ftp", "FTP")):
-            tab = QPushButton(label)
+        status_tab_keys = (
+            ("overview", "config.status_tab_overview"),
+            ("mysql", "config.status_tab_mysql"),
+            ("sync", "config.status_tab_sync"),
+            ("ftp", "config.status_tab_ftp"),
+        )
+        for key, translation_key in status_tab_keys:
+            tab = QPushButton(tr(translation_key))
             tab.setCheckable(True)
             tab.setStyleSheet("""
                 QPushButton {
@@ -2858,7 +2863,15 @@ class ConfigView(QWidget):
         # 测试连接按钮
         self.btn_test.setText(tr("config.btn_test"))
 
-        # 状卡片标
+        # 状态标签与卡片标题
+        status_tab_keys = {
+            "overview": "config.status_tab_overview",
+            "mysql": "config.status_tab_mysql",
+            "sync": "config.status_tab_sync",
+            "ftp": "config.status_tab_ftp",
+        }
+        for key, tab in self._status_tabs.items():
+            tab.setText(tr(status_tab_keys[key]))
         self.card_overview.set_title(tr("config.card_overview"))
         self.card_mysql.set_title(tr("config.card_mysql"))
         stat_card = self._find_stat_card()
