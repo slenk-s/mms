@@ -95,7 +95,7 @@ def test_succeeded_operation_is_not_claimed_again(local_db: LocalDB):
     item = claimed[0]
 
     assert local_db.mark_sync_succeeded(item["operation_id"], item["batch_id"])
-    assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+    assert local_db.get_sync_queue_item(operation_id=item["operation_id"])["status"] == "succeeded"
     assert local_db.claim_sync_batch(now="2026-09-29T10:01:00") == []
 
 
@@ -123,7 +123,7 @@ def test_retry_limit_marks_operation_failed(local_db: LocalDB):
         first["operation_id"], first["batch_id"], "first failure",
         next_retry_at="2026-09-29T10:01:00", max_attempts=1,
     )
-    item = local_db.get_sync_queue_item(first["id"])
+    item = local_db.get_sync_queue_item(operation_id=first["operation_id"])
     assert item["status"] == "failed"
     assert item["attempt_count"] == 1
     assert item["last_error"] == "first failure"
@@ -135,7 +135,7 @@ def test_recover_in_progress_operations_returns_them_to_retryable(local_db: Loca
     claimed = local_db.claim_sync_batch(now="2026-09-29T10:00:00")
 
     assert local_db.recover_in_progress_operations(now="2026-09-29T10:01:00") == 1
-    recovered = local_db.get_sync_queue_item(claimed[0]["id"])
+    recovered = local_db.get_sync_queue_item(operation_id=claimed[0]["operation_id"])
     assert recovered["status"] == "retryable"
     assert recovered["batch_id"] is None
     assert recovered["next_retry_at"] == "2026-09-29T10:01:00"
@@ -148,7 +148,7 @@ def test_status_confirmations_require_matching_in_progress_batch(local_db: Local
 
     assert not local_db.mark_sync_succeeded(claimed["operation_id"], "wrong-batch")
     assert not local_db.mark_sync_failed(claimed["operation_id"], "wrong-batch", "permanent error")
-    assert local_db.get_sync_queue_item(claimed["id"])["status"] == "in_progress"
+    assert local_db.get_sync_queue_item(operation_id=claimed["operation_id"])["status"] == "in_progress"
     assert local_db.mark_sync_failed(
         claimed["operation_id"], claimed["batch_id"], "permanent error"
     )
@@ -167,7 +167,7 @@ def test_reopening_local_db_recovers_in_progress_operations(tmp_path: Path):
 
     reopened_db = LocalDB(str(db_path), workshop="测试车间")
     try:
-        recovered = reopened_db.get_sync_queue_item(claimed[0]["id"])
+        recovered = reopened_db.get_sync_queue_item(operation_id=claimed[0]["operation_id"])
         assert recovered["status"] == "retryable"
         assert recovered["batch_id"] is None
     finally:
@@ -389,3 +389,36 @@ def test_shared_outbox_protects_public_table_during_full_replace(local_db: Local
 
     users = {user["id"] for user in local_db.query(TABLE_USERS)}
     assert users == {"local-pending-user", "cloud-user"}
+
+
+def test_same_queue_id_in_both_outboxes_needs_source_or_operation_id(local_db: LocalDB):
+    """两个 SQLite outbox 都从 id=1 开始，裸 id 绝不能跨库命中。"""
+    workshop_id = local_db.enqueue_sync_operation(
+        TABLE_MATERIALS, "UPDATE", "workshop-1", {"id": "workshop-1"},
+        operation_id="workshop-id-1",
+    )
+    shared_id = local_db.enqueue_sync_operation(
+        TABLE_USERS, "UPDATE", "shared-1", {"id": "shared-1"},
+        operation_id="shared-id-1",
+    )
+    assert (workshop_id, shared_id) == (1, 1)
+
+    with pytest.raises(ValueError, match="source"):
+        local_db.get_sync_queue_item(1)
+    with pytest.raises(ValueError, match="source"):
+        local_db.remove_sync_queue(1)
+    with pytest.raises(ValueError, match="source"):
+        local_db.increment_retry(1)
+
+    workshop = local_db.get_sync_queue_item(1, source="workshop")
+    shared = local_db.get_sync_queue_item(operation_id="shared-id-1")
+    assert workshop["operation_id"] == "workshop-id-1"
+    assert workshop["queue_source"] == "workshop"
+    assert shared["queue_source"] == "shared"
+
+    assert local_db.increment_retry(1, source="shared")
+    assert local_db.get_sync_queue_item(operation_id="shared-id-1")["attempt_count"] == 1
+    assert local_db.get_sync_queue_item(operation_id="workshop-id-1")["attempt_count"] == 0
+    assert local_db.remove_sync_queue(operation_id="workshop-id-1")
+    assert local_db.get_sync_queue_item(operation_id="workshop-id-1") is None
+    assert local_db.get_sync_queue_item(operation_id="shared-id-1") is not None

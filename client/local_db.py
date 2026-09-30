@@ -1034,7 +1034,29 @@ class LocalDB:
 
     @staticmethod
     def _with_queue_source(rows, source: str) -> List[Dict]:
-        return [{**dict(row), "_queue_source": source} for row in rows]
+        """为跨 outbox 返回项附加不可歧义的队列来源。"""
+        return [
+            {**dict(row), "queue_source": source, "_queue_source": source}
+            for row in rows
+        ]
+
+    def _queue_for_source(self, source: str):
+        """按显式来源定位唯一 outbox，禁止按裸 queue_id 跨库操作。"""
+        for candidate, queue_table, connect in self._queue_connections():
+            if candidate == source:
+                return queue_table, connect
+        raise ValueError("同步队列来源必须是 'workshop' 或 'shared'")
+
+    def _queue_item_by_operation_id(self, operation_id: str) -> Optional[Dict]:
+        """operation_id 在两个 outbox 全局唯一，是状态 API 的主标识。"""
+        for source, queue_table, connect in self._queue_connections():
+            with connect() as conn:
+                row = conn.execute(
+                    f"SELECT * FROM {_q(queue_table)} WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+            if row:
+                return self._with_queue_source([row], source)[0]
+        return None
 
     def _assert_operation_id_available(self, operation_id: str, exclude_source: Optional[str] = None) -> None:
         """在另一库检查 operation_id，避免跨两个 outbox 的标识冲突。"""
@@ -1276,15 +1298,38 @@ class LocalDB:
         rows.sort(key=lambda item: (item.get("created_at") or "", item["_queue_source"], item["id"]))
         return rows[:limit]
 
-    def remove_sync_queue(self, queue_id: int) -> None:
-        for _, queue_table, connect in self._queue_connections():
-            with connect() as conn:
-                conn.execute(f"DELETE FROM {_q(queue_table)} WHERE id = ?", (queue_id,))
+    def remove_sync_queue(self, queue_id: Optional[int] = None, *, source: Optional[str] = None,
+                          operation_id: Optional[str] = None) -> bool:
+        """删除一个 outbox 项；裸 queue_id 必须同时给出 queue source。"""
+        if operation_id is not None:
+            item = self._queue_item_by_operation_id(operation_id)
+            if not item:
+                return False
+            queue_id, source = item["id"], item["queue_source"]
+        if queue_id is None or source is None:
+            raise ValueError("queue_id 操作必须提供 source，或改用 operation_id")
+        queue_table, connect = self._queue_for_source(source)
+        with connect() as conn:
+            return conn.execute(
+                f"DELETE FROM {_q(queue_table)} WHERE id = ?", (queue_id,)
+            ).rowcount == 1
 
-    def increment_retry(self, queue_id: int) -> None:
-        for _, queue_table, connect in self._queue_connections():
-            with connect() as conn:
-                conn.execute(f"UPDATE {_q(queue_table)} SET retry_count = retry_count + 1 WHERE id = ?", (queue_id,))
+    def increment_retry(self, queue_id: Optional[int] = None, *, source: Optional[str] = None,
+                        operation_id: Optional[str] = None) -> bool:
+        """增加唯一 outbox 项的重试计数，绝不触碰另一队列的同 id 项。"""
+        if operation_id is not None:
+            item = self._queue_item_by_operation_id(operation_id)
+            if not item:
+                return False
+            queue_id, source = item["id"], item["queue_source"]
+        if queue_id is None or source is None:
+            raise ValueError("queue_id 操作必须提供 source，或改用 operation_id")
+        queue_table, connect = self._queue_for_source(source)
+        with connect() as conn:
+            return conn.execute(
+                f"UPDATE {_q(queue_table)} SET retry_count = retry_count + 1, "
+                f"attempt_count = attempt_count + 1 WHERE id = ?", (queue_id,)
+            ).rowcount == 1
 
     def get_sync_queue_count(self, statuses: Optional[Set[str]] = None) -> int:
         statuses = statuses or {"pending", "retryable", "in_progress"}
@@ -1306,13 +1351,17 @@ class LocalDB:
                 counts[row["status"]] = counts.get(row["status"], 0) + row["count"]
         return counts
 
-    def get_sync_queue_item(self, queue_id: int) -> Optional[Dict]:
-        for source, queue_table, connect in self._queue_connections():
-            with connect() as conn:
-                row = conn.execute(f"SELECT * FROM {_q(queue_table)} WHERE id = ?", (queue_id,)).fetchone()
-            if row:
-                return self._with_queue_source([row], source)[0]
-        return None
+    def get_sync_queue_item(self, queue_id: Optional[int] = None, *, source: Optional[str] = None,
+                            operation_id: Optional[str] = None) -> Optional[Dict]:
+        """读取一个 outbox 项；operation_id 优先，queue_id 必须带明确来源。"""
+        if operation_id is not None:
+            return self._queue_item_by_operation_id(operation_id)
+        if queue_id is None or source is None:
+            raise ValueError("queue_id 查询必须提供 source，或改用 operation_id")
+        queue_table, connect = self._queue_for_source(source)
+        with connect() as conn:
+            row = conn.execute(f"SELECT * FROM {_q(queue_table)} WHERE id = ?", (queue_id,)).fetchone()
+        return self._with_queue_source([row], source)[0] if row else None
 
     def get_pending_record_ids(self, table: str) -> set:
         """公共 outbox 也参与 pull 覆盖保护。"""

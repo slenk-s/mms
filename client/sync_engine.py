@@ -105,10 +105,10 @@ class SyncWorker(QObject):
     """
 
     # 结果信号（Worker → Engine，跨线程安全）
-    health_result = Signal(bool, int)            # 网络是否可达、请求序号
-    push_result = Signal(object, int, str)       # results, total_pushed, error
-    pull_result = Signal(str, object, str)      # table, records, error
-    full_sync_result = Signal(str, object, str)  # table, records, error
+    health_result = Signal(bool, int, int)            # 网络是否可达、请求序号、运行 epoch
+    push_result = Signal(object, int, str, int)       # results, total_pushed, error, 运行 epoch
+    pull_result = Signal(str, object, str, int)       # table, records, error, 运行 epoch
+    full_sync_result = Signal(str, object, str, int)  # table, records, error, 运行 epoch
 
     def __init__(self):
         super().__init__()
@@ -127,23 +127,23 @@ class SyncWorker(QObject):
 
     # ---------- 槽函数：由 Engine 通过信号触发（跨线程） ----------
 
-    @Slot(int)
-    def check_health(self, request_id: int):
+    @Slot(int, int)
+    def check_health(self, request_id: int, epoch: int):
         """检测网络及 MySQL 连通性（后台线程执行，不阻塞主线程）。"""
         self._ensure_init()
         try:
             self._mysql._ensure_conn()  # 尝试建立/恢复连接
             ok = self._mysql.health_check()
-            self.health_result.emit(ok, request_id)
+            self.health_result.emit(ok, request_id, epoch)
         except (RuntimeError, OSError, ValueError) as e:
             _log.warning("健康检查失败: %s", e)
-            self.health_result.emit(False, request_id)
+            self.health_result.emit(False, request_id, epoch)
         except Exception as e:
             _log.warning("健康检查未预期异常: %s", e)
-            self.health_result.emit(False, request_id)
+            self.health_result.emit(False, request_id, epoch)
 
-    @Slot(list)
-    def push_items(self, queue_items: list):
+    @Slot(list, int)
+    def push_items(self, queue_items: list, epoch: int):
         """推送队列项到云端(MySQL)"""
         self._ensure_init()
         results = [self._process_item(item) for item in queue_items]
@@ -151,10 +151,10 @@ class SyncWorker(QObject):
             result["outcome"] in {SYNC_APPLIED, SYNC_ALREADY_APPLIED, SYNC_CONFLICT}
             for result in results
         )
-        self.push_result.emit(results, total, "")
+        self.push_result.emit(results, total, "", epoch)
 
-    @Slot(str, str, str)
-    def pull_table(self, table: str, last_sync: str, workshop: str):
+    @Slot(str, str, str, int)
+    def pull_table(self, table: str, last_sync: str, workshop: str, epoch: int):
         self._ensure_init()
         self._mysql.set_workshop(workshop)
         try:
@@ -162,31 +162,31 @@ class SyncWorker(QObject):
                 records = self._mysql.fetch_since(table, last_sync)
             else:
                 records = self._mysql.fetch_all(table)
-            self.pull_result.emit(table, records or [], "")
+            self.pull_result.emit(table, records or [], "", epoch)
         except (RuntimeError, OSError, ValueError) as e:
             err_msg = str(e)
             _log.error("拉取 %s 失败: %s", table, err_msg)
-            self.pull_result.emit(table, [], err_msg)
+            self.pull_result.emit(table, [], err_msg, epoch)
         except Exception as e:
             err_msg = str(e)
             _log.error("拉取 %s 未预期异常: %s", table, err_msg)
-            self.pull_result.emit(table, [], err_msg)
+            self.pull_result.emit(table, [], err_msg, epoch)
 
-    @Slot(str, str)
-    def full_sync_table(self, table: str, workshop: str):
+    @Slot(str, str, int)
+    def full_sync_table(self, table: str, workshop: str, epoch: int):
         self._ensure_init()
         self._mysql.set_workshop(workshop)
         try:
             records = self._mysql.fetch_all(table)
-            self.full_sync_result.emit(table, records or [], "")
+            self.full_sync_result.emit(table, records or [], "", epoch)
         except (RuntimeError, OSError, ValueError) as e:
             err_msg = str(e)
             _log.error("全量同步 %s 失败: %s", table, err_msg)
-            self.full_sync_result.emit(table, [], err_msg)
+            self.full_sync_result.emit(table, [], err_msg, epoch)
         except Exception as e:
             err_msg = str(e)
             _log.error("全量同步 %s 未预期异常: %s", table, err_msg)
-            self.full_sync_result.emit(table, [], err_msg)
+            self.full_sync_result.emit(table, [], err_msg, epoch)
 
     # ---------- 内部处理 ----------
 
@@ -339,10 +339,10 @@ class SyncEngine(QObject):
     RUNNING = "running"
 
     # 内部调度信号（Engine → Worker，跨线程）
-    _request_health_check = Signal(int)
-    _request_push = Signal(object)
-    _request_pull = Signal(str, str, str)
-    _request_full_sync = Signal(str, str)
+    _request_health_check = Signal(int, int)
+    _request_push = Signal(object, int)
+    _request_pull = Signal(str, str, str, int)
+    _request_full_sync = Signal(str, str, int)
 
     def __init__(self, mysql_client, local_db, workshop: str = None):
         super().__init__()
@@ -355,7 +355,9 @@ class SyncEngine(QObject):
         # 保持旧 UI/调用方兼容：暂停仍属于已启动但禁用自动同步的状态。
         self._is_running: bool = False
         self._next_health_request_id = 0
-        self._allowed_health_requests: Dict[int, bool] = {}
+        self._next_sync_epoch = 0
+        self._health_request_epochs: Dict[int, int] = {}
+        self._active_sync_epochs: Dict[int, bool] = {}
         self._force_sync_requested = False
         self._sync_interval_seconds = SYNC_INTERVAL_SECONDS
         self._full_sync_interval_minutes = FULL_SYNC_INTERVAL_MINUTES
@@ -455,11 +457,38 @@ class SyncEngine(QObject):
         self._ensure_worker_and_timers()
         self._sync_cycle()
 
+    def _invalidate_sync_runs(self):
+        """撤销所有运行授权；迟到的 Worker 回调只能被丢弃。"""
+        self._next_sync_epoch += 1
+        self._health_request_epochs.clear()
+        self._active_sync_epochs.clear()
+        self._pull_table_index = 0
+        self._full_sync_pending.clear()
+
+    def _begin_sync_run(self, forced: bool) -> int:
+        self._next_sync_epoch += 1
+        epoch = self._next_sync_epoch
+        self._active_sync_epochs[epoch] = forced
+        return epoch
+
+    def _is_sync_authorized(self, epoch: Optional[int]) -> bool:
+        if epoch is None or epoch not in self._active_sync_epochs:
+            return False
+        return self._state == self.RUNNING or (
+            self._state == self.PAUSED and self._active_sync_epochs[epoch]
+        )
+
+    def _finish_sync_run(self, epoch: Optional[int]):
+        if epoch is not None:
+            self._active_sync_epochs.pop(epoch, None)
+        if self._state == self.PAUSED:
+            self._set_status(self.STATUS_OFFLINE)
+
     def pause_auto_sync(self):
-        """进入 PAUSED，并废弃暂停前已发出的健康检查授权。"""
+        """进入 PAUSED 并撤销已有自动同步运行授权。"""
         self._state = self.PAUSED
         self._is_running = True
-        self._allowed_health_requests.clear()
+        self._invalidate_sync_runs()
         if self._timer:
             self._timer.stop()
         if self._full_sync_timer:
@@ -474,7 +503,7 @@ class SyncEngine(QObject):
         """进入 STOPPED，停止计时器、废弃健康回调并退出 Worker。"""
         self._state = self.STOPPED
         self._is_running = False
-        self._allowed_health_requests.clear()
+        self._invalidate_sync_runs()
         if self._timer:
             self._timer.stop()
             self._timer = None
@@ -495,63 +524,71 @@ class SyncEngine(QObject):
     # ---------- 同步周期调度 ----------
 
     def _sync_cycle(self):
-        """触发健康检查；PAUSED 只允许 force_sync 创建的受控请求。"""
+        """创建一次带 epoch 的同步运行，回调必须持有同一授权才能继续。"""
         force = self._force_sync_requested
         self._force_sync_requested = False
         if self._state != self.RUNNING and not (force and self._state == self.PAUSED):
             return
+        epoch = self._begin_sync_run(force)
         self._next_health_request_id += 1
         request_id = self._next_health_request_id
-        self._allowed_health_requests[request_id] = force
-        self._request_health_check.emit(request_id)
+        self._health_request_epochs[request_id] = epoch
+        self._request_health_check.emit(request_id, epoch)
 
     def refresh_pull(self):
         """刷新专用：只在 RUNNING 下拉取，PAUSED 的同步入口仅 force_sync。"""
         if self._state != self.RUNNING:
             return
         self._set_status(self.STATUS_SYNCING)
-        self._start_pull()
+        self._start_pull(self._begin_sync_run(False))
 
-    def _on_worker_health(self, ok: bool, request_id: Optional[int] = None):
-        """只接受仍获授权的 health 回调，避免 pause/stop 后迟到回调继续同步。"""
+    def _on_worker_health(self, ok: bool, request_id: Optional[int] = None,
+                          epoch: Optional[int] = None):
+        """仅允许当前 epoch 的 health 回调领取队列或启动后续阶段。"""
         self._assert_main_thread()
         if request_id is None:
-            # 兼容测试/旧的直接调用；运行态以外一律不能触发同步。
+            # 仅兼容旧测试的直接调用；生产 Worker 始终提供 request_id/epoch。
             if self._state != self.RUNNING:
                 return
-            forced = False
+            epoch = self._begin_sync_run(False)
         else:
-            forced = self._allowed_health_requests.pop(request_id, None)
-            if forced is None or self._state == self.STOPPED:
+            expected_epoch = self._health_request_epochs.pop(request_id, None)
+            if expected_epoch is None or epoch != expected_epoch:
                 return
-            if self._state != self.RUNNING and not forced:
-                return
+        if not self._is_sync_authorized(epoch):
+            return
         if not ok:
             self._set_status(self.STATUS_OFFLINE)
+            self._finish_sync_run(epoch)
             return
         self._set_status(self.STATUS_SYNCING)
         queue = self.local_db.claim_sync_batch(self._sync_batch_size)
         if queue:
             self.sync_started.emit("push")
-            self._request_push.emit(queue)
+            self._request_push.emit(queue, epoch)
         else:
-            self._start_pull()
+            self._start_pull(epoch)
 
-    def _start_pull(self):
-        """开始拉取流程"""
+    def _start_pull(self, epoch: int):
+        """开始由 epoch 授权的拉取流程。"""
+        if not self._is_sync_authorized(epoch):
+            return
         self._pull_table_index = 0
         self._pull_total = 0
         self.sync_started.emit("pull")
-        self._pull_next_table()
+        self._pull_next_table(epoch)
 
-    def _pull_next_table(self):
+    def _pull_next_table(self, epoch: int):
         """拉取下一张表（智能基准选择：本地为空→全量，否则→取本地最新时间为增量基准）"""
+        if not self._is_sync_authorized(epoch):
+            return
         if self._pull_table_index >= len(self._sync_tables):
             # 拉取完成
             self.local_db.add_sync_log("pull", "success", self._pull_total)
             self.sync_completed.emit("cycle", self._pull_total)
             self._set_status(self.STATUS_ONLINE)
             self.queue_updated.emit(self.local_db.get_sync_queue_count())
+            self._finish_sync_run(epoch)
             return
 
         table = self._sync_tables[self._pull_table_index]
@@ -563,11 +600,11 @@ class SyncEngine(QObject):
             if table in self._empty_pull_tables:
                 _log.debug("表 %s 本地为空，云端上次已确认无数据，跳过拉取", table)
                 self._pull_table_index += 1
-                self._pull_next_table()
+                self._pull_next_table(epoch)
                 return
             # 本地为空 → 强制全量拉取（避免 sync_log 有旧记录导致只拉增量）
             _log.info("表 %s 本地为空，强制全量拉取", table)
-            self._request_pull.emit(table, "", self._workshop)
+            self._request_pull.emit(table, "", self._workshop, epoch)
         else:
             # 本地有数据 → 从空表集合中移除（可能之前云端为空，现在有数据了）
             self._empty_pull_tables.discard(table)
@@ -583,11 +620,14 @@ class SyncEngine(QObject):
                 last_sync = local_latest or sync_time or ""
             _log.debug("表 %s 增量拉取基准: local=%s sync=%s 使用=%s",
                        table, local_latest, sync_time, last_sync)
-            self._request_pull.emit(table, last_sync, self._workshop)
+            self._request_pull.emit(table, last_sync, self._workshop, epoch)
 
-    def _on_worker_push_result(self, results: list, total: int, error: str):
-        """确认 MySQL 幂等推送的结果，并调度下一阶段拉取。"""
+    def _on_worker_push_result(self, results: list, total: int, error: str,
+                               epoch: Optional[int] = None):
+        """确认当前授权运行的 MySQL 幂等推送结果。"""
         self._assert_main_thread()
+        if not self._is_sync_authorized(epoch):
+            return
         if not isinstance(results, list):
             _log.warning("push_result 收到非 list results: %r", type(results))
             results = []
@@ -635,11 +675,14 @@ class SyncEngine(QObject):
             self.batch_conflict_detected.emit({"tables": list(conflict_tables)})
 
         self.queue_updated.emit(self.local_db.get_sync_queue_count())
-        self._start_pull()
+        self._start_pull(epoch)
 
-    def _on_worker_pull_result(self, table: str, records: list, error: str):
+    def _on_worker_pull_result(self, table: str, records: list, error: str,
+                               epoch: Optional[int] = None):
         """Worker 单表拉取完成回调 — Qt Slot，运行在主线程"""
         self._assert_main_thread()
+        if not self._is_sync_authorized(epoch):
+            return
         # 防御：确保 records 为 list，避免 None 等异常值触发 Shiboken NoneType 转换
         if records is None:
             records = []
@@ -663,25 +706,29 @@ class SyncEngine(QObject):
                 _log.info("表 %s 云端无数据，本地仍为空，下次同步将跳过", table)
 
         self._pull_table_index += 1
-        self._pull_next_table()
+        self._pull_next_table(epoch)
 
     # ---------- 全量同步 ----------
 
     def _full_sync(self):
-        """全量同步：逐表拉取并替换本地数据。"""
+        """全量同步：每轮均绑定独立 epoch，暂停后迟到结果无权写本地。"""
         if self._state != self.RUNNING:
             return
+        epoch = self._begin_sync_run(False)
         self._full_sync_pending = set(self._sync_tables)  # 跟踪未完成的表
         self._full_sync_total = 0
         self._full_sync_failed = []
         self._empty_pull_tables.clear()  # 清空空表记录，全量同步时重新尝试所有表
         self.sync_started.emit("full_sync")
         for table in self._sync_tables:
-            self._request_full_sync.emit(table, self._workshop)
+            self._request_full_sync.emit(table, self._workshop, epoch)
 
-    def _on_worker_full_sync_result(self, table: str, records: list, error: str):
-        """Worker 全量同步单表完成回调 — Qt Slot，运行在主线程"""
+    def _on_worker_full_sync_result(self, table: str, records: list, error: str,
+                                    epoch: Optional[int] = None):
+        """Worker 全量同步单表回调；仅当前授权 epoch 可替换本地数据。"""
         self._assert_main_thread()
+        if not self._is_sync_authorized(epoch):
+            return
         # 防御：确保 records 为 list，避免 None 等异常值
         if records is None:
             records = []
@@ -718,6 +765,7 @@ class SyncEngine(QObject):
                     "pull", "full_sync", self._full_sync_total, "全量同步完成"
                 )
             self.sync_completed.emit("full_sync", self._full_sync_total)
+            self._finish_sync_run(epoch)
 
     # ---------- 本地操作（主线程，快速）----------
 

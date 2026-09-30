@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -73,7 +75,7 @@ def test_applied_results_confirm_success_without_changing_operation_id(
     result = worker._process_item(item)
     confirm_sync_results(local_db, [result], now="2026-09-29T10:00:00")
 
-    updated = local_db.get_sync_queue_item(item["id"])
+    updated = local_db.get_sync_queue_item(operation_id=item["operation_id"])
     assert fake.calls == [(
         item["operation_id"], TABLE_MATERIALS, "UPDATE", "material-1",
         {"id": "material-1", "material_name": "测试物料"}, {"allow_missing": True},
@@ -91,7 +93,7 @@ def test_connection_timeout_becomes_retryable_with_backoff(local_db: LocalDB):
     result = worker._process_item(item)
     confirm_sync_results(local_db, [result], now="2026-09-29T10:00:00")
 
-    updated = local_db.get_sync_queue_item(item["id"])
+    updated = local_db.get_sync_queue_item(operation_id=item["operation_id"])
     assert updated["status"] == "retryable"
     assert updated["operation_id"] == "op-timeout"
     assert updated["attempt_count"] == 1
@@ -106,7 +108,7 @@ def test_non_retryable_error_becomes_failed_without_changing_operation_id(local_
     result = worker._process_item(item)
     confirm_sync_results(local_db, [result], now="2026-09-29T10:00:00")
 
-    updated = local_db.get_sync_queue_item(item["id"])
+    updated = local_db.get_sync_queue_item(operation_id=item["operation_id"])
     assert updated["status"] == "failed"
     assert updated["operation_id"] == "op-invalid"
     assert updated["attempt_count"] == 0
@@ -134,7 +136,7 @@ def test_newer_cloud_update_returns_conflict_without_business_write(local_db: Lo
         conn.execute("UPDATE sync_queue SET payload = ? WHERE id = ?", (
             __import__("json").dumps(payload, ensure_ascii=False), item["id"],
         ))
-    item = local_db.get_sync_queue_item(item["id"])
+    item = local_db.get_sync_queue_item(operation_id=item["operation_id"])
     worker = SyncWorker()
     fake = ConflictFakeMySQL()
     worker._mysql = fake
@@ -157,15 +159,17 @@ def test_conflict_result_keeps_three_way_conflict_notification(local_db: LocalDB
         conn.execute("UPDATE sync_queue SET payload = ? WHERE id = ?", (
             __import__("json").dumps(payload, ensure_ascii=False), item["id"],
         ))
-    item = local_db.get_sync_queue_item(item["id"])
+    item = local_db.get_sync_queue_item(operation_id=item["operation_id"])
     result = worker._process_item(item)
     engine = SyncEngine(None, local_db)
     notifications = []
     engine.batch_conflict_detected.connect(notifications.append)
-    engine._start_pull = lambda: None
+    engine._state = engine.RUNNING
+    epoch = engine._begin_sync_run(False)
+    engine._start_pull = lambda run_epoch: None
     try:
-        engine._on_worker_push_result([result], 1, "")
-        assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+        engine._on_worker_push_result([result], 1, "", epoch)
+        assert local_db.get_sync_queue_item(operation_id=item["operation_id"])["status"] == "succeeded"
         assert notifications == [{"tables": [TABLE_MATERIALS]}]
     finally:
         engine.stop()
@@ -178,11 +182,13 @@ def _run_conflict_result(local_db: LocalDB, item, conflict):
     engine = SyncEngine(None, local_db)
     notifications = []
     engine.batch_conflict_detected.connect(notifications.append)
-    engine._start_pull = lambda: None
+    engine._state = engine.RUNNING
+    epoch = engine._begin_sync_run(False)
+    engine._start_pull = lambda run_epoch: None
     try:
         engine._on_worker_push_result([
             {"item": item, "outcome": "conflict", "error": "", "conflict_info": conflict},
-        ], 1, "")
+        ], 1, "", epoch)
     finally:
         engine.stop()
     assert app is not None
@@ -206,7 +212,7 @@ def test_conflict_three_way_merge_preserves_non_overlapping_local_and_cloud_chan
     })
 
     snapshot = local_db.get_snapshot(TABLE_MATERIALS, "material-1")
-    assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+    assert local_db.get_sync_queue_item(operation_id=item["operation_id"])["status"] == "succeeded"
     assert snapshot["material_name"] == "本地名称"
     assert snapshot["location"] == "B"
     assert notifications == []
@@ -225,7 +231,7 @@ def test_conflict_three_way_noop_refreshes_snapshot_without_notification(local_d
         "cloud": dict(base), "local": dict(base),
     })
 
-    assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+    assert local_db.get_sync_queue_item(operation_id=item["operation_id"])["status"] == "succeeded"
     assert local_db.get_snapshot(TABLE_MATERIALS, "material-1") == base
     assert notifications == []
 
@@ -317,6 +323,82 @@ def test_start_recovers_worker_and_timers_after_stop(local_db: LocalDB):
         assert engine._worker_thread.isRunning()
         assert engine._timer is not None and engine._timer.isActive()
         assert engine._full_sync_timer is not None and engine._full_sync_timer.isActive()
+    finally:
+        engine.stop()
+    assert app is not None
+
+
+class _BlockingHealthMySQL:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def _ensure_conn(self):
+        pass
+
+    def health_check(self):
+        self.started.set()
+        assert self.release.wait(2)
+        return True
+
+
+def _drain_qt_events(app, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
+
+def test_pause_revokes_real_worker_callback_before_claim_or_followup(local_db: LocalDB):
+    """真实 Worker 线程中的 health 回调在 pause 后不得进入本地同步流程。"""
+    app = QCoreApplication.instance() or QCoreApplication([])
+    engine = SyncEngine(None, local_db)
+    mysql = _BlockingHealthMySQL()
+    engine._worker._mysql = mysql
+    claims = []
+    pulls = []
+    engine.local_db.claim_sync_batch = lambda *args, **kwargs: claims.append(True) or []
+    engine._start_pull = lambda epoch: pulls.append(epoch)
+    try:
+        engine.start()
+        assert mysql.started.wait(2)
+        engine.pause_auto_sync()
+        mysql.release.set()
+        _drain_qt_events(app)
+
+        assert engine.state == engine.PAUSED
+        assert claims == []
+        assert pulls == []
+    finally:
+        mysql.release.set()
+        engine.stop()
+
+
+def test_paused_epoch_rejects_late_push_pull_and_full_sync_writes(local_db: LocalDB):
+    """同一轮授权被撤销后，三类迟到结果均不得确认、写表或继续下一表。"""
+    app = QCoreApplication.instance() or QCoreApplication([])
+    item = _claimed_item(local_db, "late-push")
+    engine = SyncEngine(None, local_db)
+    engine._state = engine.RUNNING
+    epoch = engine._begin_sync_run(False)
+    next_tables = []
+    engine._pull_next_table = lambda run_epoch: next_tables.append(run_epoch)
+    try:
+        engine.pause_auto_sync()
+        engine._on_worker_push_result([
+            {"item": item, "outcome": "applied", "error": ""},
+        ], 1, "", epoch)
+        engine._on_worker_pull_result(TABLE_MATERIALS, [{
+            "id": "late-pull", "material_code": "late",
+        }], "", epoch)
+        engine._on_worker_full_sync_result(TABLE_MATERIALS, [{
+            "id": "late-full", "material_code": "late-full",
+        }], "", epoch)
+
+        assert local_db.get_sync_queue_item(operation_id="late-push")["status"] == "in_progress"
+        assert local_db.query(TABLE_MATERIALS, "id IN (?, ?)", ("late-pull", "late-full")) == []
+        assert next_tables == []
+        assert engine.state == engine.PAUSED
     finally:
         engine.stop()
     assert app is not None
