@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
+from main import MainWindow
+from views.config_view import _FtpTestThread
 
 
 CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
@@ -332,6 +334,138 @@ def test_old_thread_results_do_not_update_replacement_thread_ui(qtbot, monkeypat
     assert mysql_updates == []
     assert ftp_updates == []
     assert port_updates == []
+
+
+class _CloseEvent:
+    def __init__(self):
+        self.accepted = False
+        self.ignored = False
+
+    def accept(self):
+        self.accepted = True
+
+    def ignore(self):
+        self.ignored = True
+
+
+class _CloseComponent:
+    def __init__(self):
+        self.calls = 0
+
+    def stop(self):
+        self.calls += 1
+
+    def clear_memory(self):
+        self.calls += 1
+
+
+class _CloseConfig(_CloseComponent):
+    def __init__(self, shutdown_result):
+        super().__init__()
+        self.shutdown_result = shutdown_result
+        self.shutdown_calls = 0
+
+    def shutdown_for_application_exit(self):
+        self.shutdown_calls += 1
+        return self.shutdown_result
+
+
+class _CloseLocalDb:
+    def __init__(self):
+        self.closed = False
+
+    def close_all(self):
+        self.closed = True
+
+
+def _main_window_close_stub(shutdown_result):
+    """构造仅覆盖 closeEvent 依赖的主窗口替身。"""
+    class Stub:
+        def saveGeometry(self):
+            return b"geometry"
+
+        def saveState(self):
+            return b"state"
+
+    stub = Stub()
+    stub.sync_engine = _CloseComponent()
+    stub.network_monitor = _CloseComponent()
+    stub._refresh_timer = _CloseComponent()
+    stub.inventory_view = _CloseComponent()
+    stub.register_view = _CloseComponent()
+    stub.asset_view = _CloseComponent()
+    stub.user_manage_view = _CloseComponent()
+    stub.config_view = _CloseConfig(shutdown_result)
+    stub._page_workers = {}
+    stub.local_db = _CloseLocalDb()
+    return stub
+
+
+def test_main_window_close_waits_for_config_thread_shutdown(monkeypatch):
+    """主窗口必须先完成配置页线程 shutdown，之后才允许关闭 LocalDB。"""
+    from utils import ui_settings
+
+    monkeypatch.setattr(ui_settings, "save_window_geometry", lambda *_args: None)
+    window = _main_window_close_stub(True)
+    event = _CloseEvent()
+
+    MainWindow.closeEvent(window, event)
+
+    assert window.config_view.shutdown_calls == 1
+    assert event.accepted is True
+    assert window.local_db.closed is True
+
+
+def test_main_window_close_aborts_when_config_threads_are_still_running(monkeypatch):
+    """配置页 shutdown 失败时不得销毁 LocalDB 或接受窗口关闭。"""
+    from utils import ui_settings
+
+    monkeypatch.setattr(ui_settings, "save_window_geometry", lambda *_args: None)
+    window = _main_window_close_stub(False)
+    event = _CloseEvent()
+
+    MainWindow.closeEvent(window, event)
+
+    assert window.config_view.shutdown_calls == 1
+    assert event.ignored is True
+    assert window.local_db.closed is False
+
+
+def test_ftp_status_thread_has_short_close_budget():
+    """FTP 状态线程连接失败应在短预算内结束，满足应用 shutdown 等待。"""
+    thread = _FtpTestThread("127.0.0.1", 1, "user", "password", timeout=0.5)
+    thread.start()
+
+    assert thread.wait(2000)
+    assert not thread.isRunning()
+
+
+def test_main_window_closes_visible_config_view_without_qthread_crash():
+    """真实离屏主窗口关闭会收敛配置页端口检测线程并干净退出。"""
+    script = textwrap.dedent(
+        """
+        from PySide6.QtWidgets import QApplication
+        from main import MainWindow
+
+        app = QApplication([])
+        window = MainWindow()
+        window.show()
+        window.stacked_widget.setCurrentWidget(window.config_view)
+        app.processEvents()
+        window.close()
+        app.processEvents()
+        """
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(CLIENT_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        timeout=20, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "QThread: Destroyed while thread is still running" not in result.stderr
 
 
 def test_visible_config_view_dispose_and_exit_without_native_thread_crash():

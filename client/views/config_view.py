@@ -3177,15 +3177,18 @@ class ConfigView(QWidget):
 
 
 class _FtpTestThread(QThread):
+    """单轮、短超时的 FTP 状态检查线程。"""
     test_finished = Signal(bool, str)
 
-    def __init__(self, host, port, user, password, directory="", parent=None):
+    def __init__(self, host, port, user, password, directory="", parent=None,
+                 timeout: float = 1.0):
         super().__init__(parent)
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.directory = directory
+        self._timeout = min(max(timeout, 0.1), 1.0)
 
     def _emit_result(self, is_online: bool, detail: str):
         if not self.isInterruptionRequested():
@@ -3193,28 +3196,28 @@ class _FtpTestThread(QThread):
 
     def run(self):
         ftp = None
+        deadline = time.monotonic() + self._timeout * 3
         try:
-            if self.isInterruptionRequested():
+            from ftplib import FTP
+            if self.isInterruptionRequested() or time.monotonic() >= deadline:
                 return
-            from utils.updater import _connect_ftp, _close_ftp
-            ftp, _, status = _connect_ftp({
-                "host": self.host, "port": self.port,
-                "user": self.user, "pass": self.password,
-                "directory": self.directory,
-            })
-            if self.isInterruptionRequested():
+            ftp = FTP(timeout=self._timeout)
+            ftp.connect(self.host, self.port, timeout=self._timeout)
+            if self.isInterruptionRequested() or time.monotonic() >= deadline:
                 return
-            if ftp is not None:
-                self._emit_result(True, "")
-            elif status == "NO_FILES":
-                self._emit_result(True, "")
-            else:
-                self._emit_result(False, "连接失败")
+            ftp.login(self.user, self.password)
+            if self.isInterruptionRequested() or time.monotonic() >= deadline:
+                return
+            if self.directory:
+                ftp.cwd(self.directory)
+            if self.isInterruptionRequested() or time.monotonic() >= deadline:
+                return
+            self._emit_result(True, "")
         except Exception as exc:
             self._emit_result(False, str(exc))
         finally:
             if ftp is not None:
                 try:
-                    _close_ftp(ftp)
+                    ftp.close()
                 except Exception:
                     pass
