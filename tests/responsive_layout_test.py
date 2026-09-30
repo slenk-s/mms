@@ -150,7 +150,7 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
         settle_layout()
         assert window.config_view._responsive_mode == "medium"
         assert window.config_view._horizontal_area.orientation() == Qt.Vertical
-        assert window.config_view._bottom_stack.orientation() == Qt.Vertical
+        assert window.config_view._horizontal_area.orientation() == Qt.Vertical
         assert window.nav_bar.is_collapsed() is False
         assert not hasattr(window.nav_bar, "collapse_button")
 
@@ -193,30 +193,27 @@ def test_config_view_reflows_existing_containers_without_recreating_controls(vis
     db_host = view.db_host
     status_panel = view._status_panel
     stats_card = view.card_stats
-    actions_card = view.card_actions
+    actions_card = view.card_stats
 
     view.set_responsive_mode("wide")
     assert view._horizontal_area.isVisible()
     assert status_panel.parentWidget() is view._horizontal_area
     assert view._horizontal_area.orientation() == Qt.Horizontal
-    assert view._bottom_stack.orientation() == Qt.Horizontal
 
     view.set_responsive_mode("medium")
     assert status_panel.parentWidget() is view._horizontal_area
     assert view._horizontal_area.orientation() == Qt.Vertical
     assert view._horizontal_area.indexOf(view._config_panel) == 0
     assert view._horizontal_area.indexOf(status_panel) == 1
-    assert view._bottom_stack.orientation() == Qt.Vertical
 
     view.set_responsive_mode("narrow")
     assert status_panel.parentWidget() is view._horizontal_area
     assert view._horizontal_area.orientation() == Qt.Vertical
     assert view._horizontal_area.indexOf(view._config_panel) == 0
     assert view._horizontal_area.indexOf(status_panel) == 1
-    assert view._bottom_stack.orientation() == Qt.Vertical
     assert view.db_host is db_host
     assert view.card_stats is stats_card
-    assert view.card_actions is actions_card
+    assert view.card_stats is actions_card
 
     view.set_responsive_mode("wide")
     assert status_panel.parentWidget() is view._horizontal_area
@@ -242,23 +239,22 @@ def test_config_view_reflows_stats_and_workshop_controls_at_all_breakpoints(
     )
 
     expectations = (
-        ("wide", 1250, Qt.Horizontal, Qt.Horizontal, 2, QBoxLayout.LeftToRight),
-        ("medium", 900, Qt.Vertical, Qt.Vertical, 2, QBoxLayout.LeftToRight),
-        ("narrow", 800, Qt.Vertical, Qt.Vertical, 1, QBoxLayout.TopToBottom),
+        ("wide", 1250, Qt.Horizontal, Qt.Horizontal, 2, QBoxLayout.TopToBottom),
+        ("medium", 900, Qt.Vertical, Qt.Vertical, 2, QBoxLayout.TopToBottom),
+        ("narrow", 800, Qt.Vertical, Qt.Vertical, 2, QBoxLayout.TopToBottom),
         (
             "wide", 1250, Qt.Horizontal, Qt.Horizontal, 2,
-            QBoxLayout.LeftToRight,
+            QBoxLayout.TopToBottom,
         ),
     )
     for mode, width, area_orientation, bottom_orientation, columns, workshop_orientation in expectations:
         view.resize(width, 900)
         view.set_responsive_mode(mode)
         QApplication.processEvents()
-        view.card_actions.adjustSize()
+        view.card_stats.layout().activate()
         QApplication.processEvents()
 
         assert view._horizontal_area.orientation() == area_orientation
-        assert view._bottom_stack.orientation() == bottom_orientation
         actual_positions = tuple(
             view._stat_grid.getItemPosition(index)[:2]
             for index in range(view._stat_grid.count())
@@ -302,12 +298,13 @@ def test_config_view_keeps_complete_config_and_status_content_across_breakpoints
 
         groups = tuple(view._config_groups.values())
         cards = (
-            view.card_overview,
+            view.card_stats,
             view.card_mysql,
             view.card_sync,
             view.card_ftp,
         )
         assert len(groups) == 6
+        assert sum(group._expanded for group in groups) == 1
         assert view._config_scroll.widget().isAncestorOf(groups[0])
 
         status_content = view._status_scroll.widget()
@@ -321,7 +318,7 @@ def test_config_view_keeps_complete_config_and_status_content_across_breakpoints
             view.set_responsive_mode(mode)
             app.processEvents()
             assert all(
-                group._expanded and group._content.isVisible() and group.isVisible()
+                group.isVisible()
                 for group in groups
             )
             assert all(view._config_scroll.widget().isAncestorOf(group) for group in groups)
@@ -406,11 +403,10 @@ def test_config_view_narrow_bottom_auxiliary_controls_scroll_without_clipping(
     view.resize(500, 700)
     QApplication.processEvents()
 
-    bottom_scroll = view._bottom_scroll
+    bottom_scroll = view._status_scroll
     viewport = bottom_scroll.viewport()
+    assert view.btn_export.isVisible() and view.btn_import.isVisible()
     controls = (
-        view.btn_export,
-        view.btn_import,
         view.btn_clear_queue,
         view.lbl_workshop,
         view.cbx_workshop,

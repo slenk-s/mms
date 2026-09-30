@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QFormLayout, QSpinBox, QComboBox,
     QScrollArea, QGridLayout, QFileDialog, QSizePolicy,
-    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout, QBoxLayout,
+    QApplication, QDialog, QListWidget, QListWidgetItem, QSplitter, QLayout, QBoxLayout, QBoxLayout,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor, QFontMetrics
@@ -187,12 +187,14 @@ class PortCheckThread(QThread):
 
 
 class ConfigGroup(QFrame):
-    """始终展开的配置分组卡片。"""
+    """单选手风琴配置组，控件始终复用。"""
+
+    activated = Signal(object)
 
     def __init__(self, title: str, group_type: str, parent=None):
         super().__init__(parent)
         self._group_type = group_type
-        self._expanded = True
+        self._expanded = False
         self._init_ui(title)
 
     def _init_ui(self, title: str):
@@ -223,21 +225,18 @@ class ConfigGroup(QFrame):
         header_layout = QHBoxLayout(self._header)
         header_layout.setContentsMargins(14, 10, 14, 10)
 
-        self._title_lbl = QLabel(f"{colors['icon']} {title}")
-        self._title_lbl.setFont(QFont("Microsoft YaHei", 13, QFont.Weight.Bold))
-        self._title_lbl.setStyleSheet("color: #374151; background: transparent;")
-        header_layout.addWidget(self._title_lbl)
-        header_layout.addStretch()
-
-        self._toggle_btn = QLabel("▲")
-        self._toggle_btn.setStyleSheet("color: #6b7280; font-size: 12px; background: transparent;")
+        self._toggle_btn = QPushButton(f"{colors['icon']} {title}")
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setMinimumHeight(36)
+        self._toggle_btn.setStyleSheet("text-align: left; color: #374151; background: transparent; border: none;")
+        self._toggle_btn.clicked.connect(lambda: self.activated.emit(self))
+        self._header.mousePressEvent = lambda event: self.activated.emit(self)
+        self._title_lbl = self._toggle_btn
         header_layout.addWidget(self._toggle_btn)
         self._layout.addWidget(self._header)
-
-        # 内容区域始终可见，溢出由配置滚动区承接。
         self._content = QFrame()
         self._content.setStyleSheet("background-color: #ffffff; border: none;")
-        self._content.setVisible(True)
+        self._content.setVisible(False)
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(14, 10, 14, 14)
         self._content_layout.setSpacing(10)
@@ -248,10 +247,11 @@ class ConfigGroup(QFrame):
         return self._content_layout
 
     def set_expanded(self, expanded: bool = True):
-        """保持完整表单展开；滚动区处理可视范围之外的内容。"""
-        self._expanded = True
-        self._toggle_btn.setText("▲")
-        self._content.setVisible(True)
+        self._expanded = bool(expanded)
+        self._toggle_btn.setChecked(self._expanded)
+        self._toggle_btn.setAccessibleDescription("expanded" if self._expanded else "collapsed")
+        self._content.setVisible(self._expanded)
+        self.updateGeometry()
 
     def set_title(self, title: str):
         colors = GROUP_COLORS.get(self._group_type, GROUP_COLORS["database"])
@@ -571,24 +571,27 @@ class ConfigView(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
-        # 标题
-        header = QHBoxLayout()
+        self._header_widget = QWidget()
+        self._header_layout = QBoxLayout(QBoxLayout.LeftToRight, self._header_widget)
+        self._header_layout.setContentsMargins(0, 0, 0, 0)
         self._page_title = QLabel(tr("config.page_title"))
         self._page_title.setFont(QFont("Microsoft YaHei", 17, QFont.Weight.Bold))
         self._page_title.setStyleSheet("color: #2563eb;")
-        header.addWidget(self._page_title)
-        header.addStretch()
-
-        self.btn_save = QPushButton(tr("config.btn_save"))
-        self.btn_save.setStyleSheet(BTN_PRIMARY)
-        self.btn_save.clicked.connect(self._on_save_clicked)
-        header.addWidget(self.btn_save)
-
-        self.btn_reset = QPushButton(tr("config.btn_reset"))
-        self.btn_reset.setStyleSheet(BTN_SECONDARY)
-        self.btn_reset.clicked.connect(self._on_reset_clicked)
-        header.addWidget(self.btn_reset)
-        left_layout.addLayout(header)
+        self._header_layout.addWidget(self._page_title)
+        self._header_actions = QGridLayout()
+        for index, (name, key, callback) in enumerate([
+            ("btn_export", "config.btn_export", self._export_config),
+            ("btn_import", "config.btn_import", self._import_config),
+            ("btn_save", "config.btn_save", self._on_save_clicked),
+            ("btn_reset", "config.btn_reset", self._on_reset_clicked),
+        ]):
+            button = QPushButton(tr(key))
+            button.setStyleSheet(BTN_PRIMARY if name == "btn_save" else BTN_SECONDARY)
+            button.clicked.connect(callback)
+            setattr(self, name, button)
+            self._header_actions.addWidget(button, 0, index)
+        self._header_layout.addLayout(self._header_actions)
+        self._outer_layout.addWidget(self._header_widget)
 
         # 滚动区域
         self._config_scroll = QScrollArea()
@@ -635,9 +638,10 @@ class ConfigView(QWidget):
         self._build_update_form(group_update.content_layout())
         self._scroll_layout.addWidget(group_update)
 
-        # 所有配置组固定展开，配置滚动区负责承接完整表单的溢出。
-        for grp in self._config_groups.values():
-            grp.set_expanded(True)
+        # 单选展开；其余组标题保留，切换不会重建表单。
+        for key, grp in self._config_groups.items():
+            grp.activated.connect(self._activate_config_group)
+            grp.set_expanded(key == "database")
 
         self._scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -668,14 +672,6 @@ class ConfigView(QWidget):
         self._right_layout.setSpacing(12)
         self._status_scroll.setWidget(self._status_content)
         status_panel_layout.addWidget(self._status_scroll)
-
-        # 卡片 1：系统概
-        self.card_overview = StatusCard(tr("config.card_overview"), "\U0001f4ca", "#2563eb")
-        self.card_overview.set_row("version", tr("config.label_version"), APP_VERSION)
-        self.card_overview.set_row("mode", tr("config.label_mode"), APP_MODE)
-        self.card_overview.set_row("db_file", tr("config.label_db_file"), "...")
-        self.card_overview.set_row("total", tr("config.label_total"), "0")
-        self._right_layout.addWidget(self.card_overview)
 
         # 卡片 2：MySQL 连接
         self.card_mysql = StatusCard(tr("config.card_mysql"), "\U0001f5c4", "#10b981")
@@ -718,22 +714,12 @@ class ConfigView(QWidget):
         stat_card.body().addLayout(self._stat_grid)
         self.card_stats = stat_card
 
-        # 卡片 5：快捷操作（始终在底部，不占用右侧分栏）
-        self.card_actions = StatusCard(tr("config.card_actions"), "⚡", "#ec4899")
-        self.btn_export = QPushButton(tr("config.btn_export"))
-        self.btn_export.setStyleSheet(BTN_SECONDARY.replace("padding: 8px 16px", "padding: 6px 12px"))
-        self.btn_export.clicked.connect(self._export_config)
-        self.card_actions.body().addWidget(self.btn_export)
-
-        self.btn_import = QPushButton(tr("config.btn_import"))
-        self.btn_import.setStyleSheet(BTN_SECONDARY.replace("padding: 8px 16px", "padding: 6px 12px"))
-        self.btn_import.clicked.connect(self._import_config)
-        self.card_actions.body().addWidget(self.btn_import)
-
+        self._right_layout.insertWidget(0, self.card_stats)
         self.btn_clear_queue = QPushButton(tr("config.btn_clear_queue"))
         self.btn_clear_queue.setStyleSheet(BTN_DANGER)
+        self.btn_clear_queue.setMinimumHeight(36)
         self.btn_clear_queue.clicked.connect(self._clear_sync_queue)
-        self.card_actions.body().addWidget(self.btn_clear_queue)
+        self.card_sync.body().addWidget(self.btn_clear_queue)
 
         # 车间切换区域
         self._init_workshop_selector()
@@ -745,77 +731,35 @@ class ConfigView(QWidget):
 
         self._outer_layout.addWidget(self._horizontal_area, stretch=1)
 
-        # 统计与快捷操作也复用同一组卡片，仅改变 splitter 的方向。
-        # 窄屏时由外层滚动区承接纵向 splitter 的完整内容，避免底部卡片
-        # 被压缩后将车间标签或管理按钮裁切在可视区域之外。
-        self._bottom_stack = QSplitter(Qt.Horizontal)
-        self._bottom_stack.setChildrenCollapsible(False)
-        self._bottom_stack.setMinimumSize(0, 0)
-        self._bottom_stack.addWidget(self.card_stats)
-        self._bottom_stack.addWidget(self.card_actions)
-        self._bottom_stack.setStretchFactor(0, 1)
-        self._bottom_stack.setStretchFactor(1, 1)
-        self._bottom_scroll = QScrollArea()
-        self._bottom_scroll.setMinimumSize(0, 0)
-        self._bottom_scroll.setWidgetResizable(True)
-        self._bottom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._bottom_scroll.setStyleSheet(
-            "QScrollArea { border: none; background: transparent; }"
-        )
-        self._bottom_scroll.setWidget(self._bottom_stack)
-        # 保留旧属性，兼容既有内部访问。
-        self._bottom_area = self._bottom_stack
-        self._outer_layout.addWidget(self._bottom_scroll, stretch=0)
         self.set_responsive_mode(self._responsive_mode)
 
+    def _activate_config_group(self, selected):
+        for group in self._config_groups.values():
+            group.set_expanded(group is selected)
+
     def set_responsive_mode(self, mode: str):
-        """按模式重排既有容器，不重新创建任何配置表单或状态卡。"""
+        """配置内容和独立滚动侧栏自适应；不重建控件。"""
         if mode not in {"wide", "medium", "narrow"}:
             raise ValueError("responsive mode must be one of: wide, medium, narrow")
-
-        if mode in {"medium", "narrow"}:
-            # 内容区不足以并排承载配置与状态时，状态区下移并纵向排列。
-            # 保持两个面板始终属于同一 splitter，只切换方向，避免 QWidget
-            # 在 QSplitter 与普通布局之间重设父对象导致的销毁顺序问题。
-            self._horizontal_area.setOrientation(Qt.Vertical)
-            self._config_panel.setMinimumWidth(0)
-            self._status_panel.setMinimumWidth(0)
-            self._status_panel.setMaximumWidth(16777215)
-            self._status_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self._horizontal_area.setSizes([700, 360])
-            self._bottom_stack.setOrientation(Qt.Vertical)
-        else:
-            self._horizontal_area.setOrientation(Qt.Horizontal)
-            self._config_panel.setMinimumWidth(620)
-            self._status_panel.setMinimumWidth(240)
-            self._status_panel.setMaximumWidth(16777215)
-            self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-            self._bottom_stack.setOrientation(Qt.Horizontal)
-            self._horizontal_area.setSizes([900, 320])
-
-        self._set_stat_grid_columns(1 if mode == "narrow" else 2)
-        self._workshop_layout.setDirection(
-            QBoxLayout.TopToBottom if mode == "narrow" else QBoxLayout.LeftToRight
-        )
-        self._workshop_layout.invalidate()
-        self.card_stats.layout().invalidate()
-        self.card_stats.layout().activate()
-        self.card_stats.updateGeometry()
-        self.card_actions.layout().invalidate()
-        self.card_actions.layout().activate()
-        self.card_actions.updateGeometry()
-        self._bottom_stack.updateGeometry()
-        if mode in {"medium", "narrow"}:
-            bottom_content_height = (
-                self.card_stats.minimumSizeHint().height()
-                + self.card_actions.minimumSizeHint().height()
-                + self._bottom_stack.handleWidth()
-            )
-            self._bottom_stack.setMinimumHeight(bottom_content_height)
-        else:
-            self._bottom_stack.setMinimumHeight(0)
-        self._outer_layout.invalidate()
-        self._outer_layout.activate()
+        wide = mode == "wide"
+        self._horizontal_area.setOrientation(Qt.Horizontal if wide else Qt.Vertical)
+        self._config_panel.setMinimumWidth(0)
+        self._status_panel.setMinimumWidth(280 if wide else 0)
+        self._status_panel.setMaximumWidth(360 if wide else 16777215)
+        self._status_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self._horizontal_area.setSizes([800, 320] if wide else [440, 280])
+        self._set_stat_grid_columns(2)
+        self._workshop_layout.setDirection(QBoxLayout.TopToBottom)
+        self.card_stats.layout().setSizeConstraint(QLayout.SetMinimumSize)
+        self.card_sync.layout().setSizeConstraint(QLayout.SetMinimumSize)
+        self._right_layout.setSizeConstraint(QLayout.SetMinimumSize)
+        self._header_layout.setDirection(QBoxLayout.LeftToRight if wide else QBoxLayout.TopToBottom)
+        buttons = (self.btn_export, self.btn_import, self.btn_save, self.btn_reset)
+        for button in buttons:
+            self._header_actions.removeWidget(button)
+        columns = 2 if mode == "narrow" else 4
+        for index, button in enumerate(buttons):
+            self._header_actions.addWidget(button, index // columns, index % columns)
         self._responsive_mode = mode
         self._refresh_status_value_displays()
 
@@ -837,7 +781,7 @@ class ConfigView(QWidget):
             self._stat_grid.addWidget(card, index // columns, index % columns)
 
     def _refresh_status_value_displays(self):
-        for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
+        for card in (self.card_stats, self.card_mysql, self.card_sync, self.card_ftp):
             card.refresh_value_display()
 
     def set_main_window_responsive_mode(self, mode: str):
@@ -2358,7 +2302,6 @@ class ConfigView(QWidget):
         stats = self._get_all_stats()
 
         # 系统概览（增量更新）
-        self._update_card_overview(stats)
 
         # 数据量统计（迷你卡片
         self._update_mini_stats(stats)
@@ -2460,21 +2403,6 @@ class ConfigView(QWidget):
         self._stats_cache = stats
         self._stats_cache_time = now
         return stats
-
-    def _update_card_overview(self, stats: dict):
-        """系统概览 增量更新"""
-        mode = self.app_mode.currentText() if hasattr(self, "app_mode") else "online"
-        mode_labels = {
-            "online": (tr("config.mode_online"), "#059669"),
-            "semi_offline": (tr("config.mode_semi_offline"), "#d97706"),
-            "offline": (tr("config.mode_offline"), "#dc2626"),
-        }
-        label, color = mode_labels.get(mode, (mode, "#1f2937"))
-
-        self.card_overview.set_row("version", tr("config.label_version"), APP_VERSION)
-        self.card_overview.set_row("mode", tr("config.label_mode"), label, color)
-        self.card_overview.set_row("db_file", tr("config.label_db_file"), stats.get("db_file", "..."))
-        self.card_overview.set_row("total", tr("config.label_total"), tr("config.records_count", count=stats.get("total", 0)))
 
     def _update_mini_stats(self, stats: dict):
         """更新 2x2 迷你统计卡片"""
@@ -2840,19 +2768,13 @@ class ConfigView(QWidget):
         self.btn_test.setText(tr("config.btn_test"))
 
         # 状卡片标
-        self.card_overview.set_title(tr("config.card_overview"))
         self.card_mysql.set_title(tr("config.card_mysql"))
         stat_card = self._find_stat_card()
         if stat_card:
             stat_card.set_title(tr("config.card_stats"))
         self.card_sync.set_title(tr("config.card_sync"))
-        self.card_actions.set_title(tr("config.card_actions"))
 
         # 状卡片行标签
-        self.card_overview.set_row("version", tr("config.label_version"), APP_VERSION)
-        self.card_overview.set_row("mode", tr("config.label_mode"), self.card_overview.get_row_value("mode") or "")
-        self.card_overview.set_row("db_file", tr("config.label_db_file"), self.card_overview.get_row_value("db_file") or "...")
-        self.card_overview.set_row("total", tr("config.label_total"), self.card_overview.get_row_value("total") or "0")
 
         self.card_mysql.set_row("host", tr("config.label_host"), self.card_mysql.get_row_value("host") or "")
         self.card_mysql.set_row("port", tr("config.label_port"), self.card_mysql.get_row_value("port") or "")
@@ -2884,11 +2806,7 @@ class ConfigView(QWidget):
             self._update_status_panel()
 
     def _find_stat_card(self):
-        """查找右侧的统计数据卡片（StatusCard 实例"""
-        for child in self.findChildren(StatusCard):
-            if child is not self.card_overview and child is not self.card_mysql and child is not self.card_sync and child is not self.card_actions:
-                return child
-        return None
+        return self.card_stats
 
     # ==================== 生命周期 ====================
 
@@ -3017,7 +2935,7 @@ class ConfigView(QWidget):
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Sunken)
         sep.setStyleSheet("background-color: #e5e7eb; max-height: 1px;")
-        self.card_actions.body().addWidget(sep)
+        self.card_stats.body().addWidget(sep)
 
         self._workshop_layout = QHBoxLayout()
         ws_layout = self._workshop_layout
@@ -3047,7 +2965,7 @@ class ConfigView(QWidget):
         self.btn_workshop_manage.clicked.connect(self._show_workshop_manager)
         ws_layout.addWidget(self.btn_workshop_manage)
 
-        self.card_actions.body().addLayout(ws_layout)
+        self.card_stats.body().addLayout(ws_layout)
         self._load_workshops()
 
     def _load_workshops(self):
