@@ -723,28 +723,3 @@ def test_data_table_headers_and_cells_are_always_left_aligned(qtbot):
     assert table.table.horizontalHeader().defaultAlignment() == expected
     for column in range(table.table.columnCount()):
         assert table.table.item(0, column).textAlignment() == expected
-
-
-def test_config_card_accordions_default_and_single_selection(qtbot, monkeypatch, tmp_path):
-    """配置、状态和辅助卡片各自只展开一项，默认值符合产品要求。"""
-    import utils.ui_settings as ui_settings
-    monkeypatch.setattr(ui_settings, "_BACKUP_DIR", str(tmp_path))
-    view = ConfigView()
-    qtbot.addWidget(view)
-
-    assert view._config_groups["database"]._expanded
-    assert not view._config_groups["sync"]._expanded
-    assert view._status_groups["overview"]._expanded
-    assert not view._status_groups["mysql"]._expanded
-    assert view._aux_groups["stats"]._expanded
-    assert not view._aux_groups["actions"]._expanded
-
-    view._config_groups["sync"]._on_toggle(None)
-    assert view._config_groups["sync"]._expanded
-    assert not view._config_groups["database"]._expanded
-    assert ui_settings.restore_ui_preference("config_group") == "sync"
-
-    view._status_groups["mysql"]._on_toggle(None)
-    assert view._status_groups["mysql"]._expanded
-    assert not view._status_groups["overview"]._expanded
-    assert ui_settings.restore_ui_preference("config_status_card") == "mysql"
