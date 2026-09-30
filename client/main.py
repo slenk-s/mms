@@ -574,7 +574,7 @@ class MainWindow(QMainWindow):
                 self._navigation_auto_collapsed = False
 
         if hasattr(self, "config_view"):
-            self.config_view.set_responsive_mode(mode)
+            self.config_view.set_main_window_responsive_mode(mode)
 
     def _schedule_responsive_layout_confirmation(self, width: int):
         """在子控件布局完成后，安全地确认主窗口断点仍为最终模式。"""
@@ -597,7 +597,7 @@ class MainWindow(QMainWindow):
                     return
                 mode = window._responsive_mode_for_width(width)
                 if config_view._responsive_mode != mode:
-                    config_view.set_responsive_mode(mode)
+                    config_view.set_main_window_responsive_mode(mode)
             except RuntimeError:
                 # Qt 对象已在排队回调执行前销毁。
                 return

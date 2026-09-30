@@ -509,6 +509,8 @@ class ConfigView(QWidget):
         self._stats_cache_time = 0
         self._prog_dialog = None
         self._is_disposed = False
+        # 嵌入 MainWindow 后，响应式断点仅由 central_widget 宽度决定。
+        self._responsive_mode_managed_by_main_window = False
         self._init_ui()
 
     # v2.3: 支持外部注入 LocalDB 实例
@@ -785,6 +787,14 @@ class ConfigView(QWidget):
         for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):
             card.refresh_value_display()
 
+    def set_main_window_responsive_mode(self, mode: str):
+        """由 MainWindow central_widget 宽度分发模式，并锁定局部 resize 覆盖。"""
+        self._responsive_mode_managed_by_main_window = True
+        if mode != self._responsive_mode:
+            self.set_responsive_mode(mode)
+        else:
+            self._refresh_status_value_displays()
+
     @staticmethod
     def _responsive_mode_for_width(width: int) -> str:
         if width >= 1400:
@@ -795,6 +805,9 @@ class ConfigView(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._responsive_mode_managed_by_main_window:
+            self._refresh_status_value_displays()
+            return
         mode = self._responsive_mode_for_width(self.contentsRect().width())
         if mode != self._responsive_mode:
             self.set_responsive_mode(mode)
@@ -2891,18 +2904,34 @@ class ConfigView(QWidget):
         self._cleanup_ftp_test_thread()
         self._cleanup_web_process(sync_status=False)
 
-    def dispose(self):
-        """页面隐藏/切换使用的非阻塞清理：仅请求协作式取消。"""
-        self._is_disposed = True
+    def _request_application_exit_shutdown(self):
+        """请求后台资源停止；仅在最终关闭确认前不永久处置页面。"""
         self._stop_status_timer()
         self._cleanup_mysql_test_thread()
         self._cleanup_port_check_thread()
         self._cleanup_ftp_test_thread()
         self._cleanup_web_process(sync_status=False)
 
+    def dispose(self):
+        """页面隐藏/切换使用的非阻塞清理：仅请求协作式取消。"""
+        self._is_disposed = True
+        self._request_application_exit_shutdown()
+
+    def _restore_after_failed_application_exit_shutdown(self, timer_was_active: bool):
+        """关闭被拒绝后恢复页面可用性，避免遗留永久 disposed 状态。"""
+        self._is_disposed = False
+        if timer_was_active or self.isVisible():
+            self._start_status_timer()
+        QTimer.singleShot(0, self._update_status_panel)
+
     def shutdown_for_application_exit(self, timeout_ms: int = 5000) -> bool:
         """应用最终退出路径：请求取消后进行总时长受限的线程等待。"""
-        self.dispose()
+        was_disposed = self._is_disposed
+        timer_was_active = (
+            hasattr(self, "_status_timer") and self._status_timer.isActive()
+        )
+        self._is_disposed = True
+        self._request_application_exit_shutdown()
         deadline = time.monotonic() + max(timeout_ms, 0) / 1000
         for attribute in (
             "_mysql_test_thread", "_port_check_thread", "_ftp_test_thread"
@@ -2919,12 +2948,15 @@ class ConfigView(QWidget):
                     self._clear_finished_thread(attribute, thread)
             except (RuntimeError, AttributeError):
                 setattr(self, attribute, None)
-        return not any(
+        shutdown_complete = not any(
             self._thread_is_running(getattr(self, attribute, None))
             for attribute in (
                 "_mysql_test_thread", "_port_check_thread", "_ftp_test_thread"
             )
         )
+        if not shutdown_complete and not was_disposed:
+            self._restore_after_failed_application_exit_shutdown(timer_was_active)
+        return shutdown_complete
 
     def closeEvent(self, event):
         """显式关闭配置页时走应用退出级清理，页面 hide 仍保持非阻塞。"""

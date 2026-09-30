@@ -200,6 +200,13 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
 
         window.resize(1400, 900)
         settle_layout()
+        assert window.config_view._responsive_mode == "wide"
+        for collapsed in (True, False):
+            window.nav_bar.set_collapsed(collapsed, persist=False)
+            settle_layout()
+            assert window.central_widget.contentsRect().width() == 1400
+            assert window.config_view._responsive_mode == "wide"
+
         window.nav_bar.set_collapsed(False)
         window.resize(1099, 900)
         settle_layout()
@@ -353,6 +360,24 @@ class _UnstoppableThread:
 
     def terminate(self):
         self.terminate_calls += 1
+
+
+def test_failed_application_exit_shutdown_restores_visible_config_view(qtbot, monkeypatch):
+    """超时取消关闭后，仍打开的配置页必须恢复可刷新状态。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    view.show()
+    QApplication.processEvents()
+    updates = []
+    monkeypatch.setattr(view, "_update_status_panel", lambda: updates.append("refresh"))
+    view._mysql_test_thread = _UnstoppableThread()
+
+    assert view.shutdown_for_application_exit(0) is False
+    assert view._is_disposed is False
+    assert view._status_timer.isActive()
+
+    QApplication.processEvents()
+    assert updates == ["refresh"]
 
 
 def test_clear_memory_never_starts_port_check_thread(qtbot, monkeypatch):
