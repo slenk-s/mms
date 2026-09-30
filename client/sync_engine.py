@@ -348,6 +348,10 @@ class SyncEngine(QObject):
         self._workshop = workshop or ""
         self._sync_status: str = self.STATUS_OFFLINE
         self._is_running: bool = False
+        self._sync_interval_seconds = SYNC_INTERVAL_SECONDS
+        self._full_sync_interval_minutes = FULL_SYNC_INTERVAL_MINUTES
+        self._sync_batch_size = SYNC_BATCH_SIZE
+        self._sync_retry_max = SYNC_RETRY_MAX
         self._timer: Optional[QTimer] = None
         self._full_sync_timer: Optional[QTimer] = None
         self._on_conflict_callback: Optional[Callable] = None
@@ -400,6 +404,17 @@ class SyncEngine(QObject):
     def set_conflict_callback(self, callback: Callable):
         self._on_conflict_callback = callback
 
+    def apply_settings(self, sync_interval_seconds: int, full_sync_interval_minutes: int,
+                       sync_batch_size: int, sync_retry_max: int):
+        """立即应用已保存的同步参数，并更新运行中的计时器。"""
+        self._sync_interval_seconds = max(5, int(sync_interval_seconds))
+        self._full_sync_interval_minutes = max(5, int(full_sync_interval_minutes))
+        self._sync_batch_size = max(1, int(sync_batch_size))
+        self._sync_retry_max = max(1, int(sync_retry_max))
+        if self._timer and self._timer.isActive():
+            self._timer.start(self._sync_interval_seconds * 1000)
+        if self._full_sync_timer and self._full_sync_timer.isActive():
+            self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
     def start(self):
         if self._is_running:
             return
@@ -410,17 +425,17 @@ class SyncEngine(QObject):
         if self._timer is None:
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._sync_cycle)
-        self._timer.start(SYNC_INTERVAL_SECONDS * 1000)
+        self._timer.start(self._sync_interval_seconds * 1000)
         if self._full_sync_timer is None:
             self._full_sync_timer = QTimer(self)
             self._full_sync_timer.timeout.connect(self._full_sync)
-        self._full_sync_timer.start(FULL_SYNC_INTERVAL_MINUTES * 60 * 1000)
+        self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
         self._sync_cycle()
 
     def pause_auto_sync(self):
         """暂停自动定时同步（半离线模式使用）
         停止定时器但保持 Worker 线程，force_sync() 仍可手动触发"""
-        self._is_running = False
+        self._is_running = True
         if self._timer:
             self._timer.stop()
         if self._full_sync_timer:
@@ -438,16 +453,16 @@ class SyncEngine(QObject):
         if self._timer is None:
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._sync_cycle)
-        self._timer.start(SYNC_INTERVAL_SECONDS * 1000)
+        self._timer.start(self._sync_interval_seconds * 1000)
         if self._full_sync_timer is None:
             self._full_sync_timer = QTimer(self)
             self._full_sync_timer.timeout.connect(self._full_sync)
-        self._full_sync_timer.start(FULL_SYNC_INTERVAL_MINUTES * 60 * 1000)
+        self._full_sync_timer.start(self._full_sync_interval_minutes * 60 * 1000)
         self._sync_cycle()
 
     def stop(self):
         """完全停止同步引擎（离线模式使用）"""
-        self._is_running = False
+        self._is_running = True
         if self._timer:
             self._timer.stop()
             self._timer = None
@@ -487,7 +502,7 @@ class SyncEngine(QObject):
             return
         self._set_status(self.STATUS_SYNCING)
         # 先原子领取待同步队列；只确认当前批次中的 in_progress 项。
-        queue = self.local_db.claim_sync_batch(SYNC_BATCH_SIZE)
+        queue = self.local_db.claim_sync_batch(self._sync_batch_size)
         if queue:
             self.sync_started.emit("push")
             self._request_push.emit(queue)

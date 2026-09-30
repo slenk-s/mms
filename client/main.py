@@ -1681,6 +1681,13 @@ class MainWindow(QMainWindow):
                 break
 
         self._persist_configs(configs, now)
+        config_map = {item["config_name"]: item["content"] for item in configs}
+        self.sync_engine.apply_settings(
+            int(config_map["SYNC_INTERVAL_SECONDS"]),
+            int(config_map["FULL_SYNC_INTERVAL_MINUTES"]),
+            int(config_map["SYNC_BATCH_SIZE"]),
+            int(config_map["SYNC_RETRY_MAX"]),
+        )
         self._apply_mode_change(self._app_mode, new_mode)
         # 配置保存后重新检查 MySQL 禁用状态（新密码/新host 生效）
         self.mysql_client.recheck_disabled()
