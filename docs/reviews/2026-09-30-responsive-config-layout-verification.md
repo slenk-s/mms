@@ -26,11 +26,11 @@
 1. 1400 / 1399 / 1099 三个断点与 resize 后的 `ConfigView` 模式；
 2. 窄屏导航自动折叠；
 3. 宽屏恢复已持久化的“导航展开”用户偏好，且偏好值不被自动折叠改写；
-4. 登录覆盖层可见时，resize 后仍为 `(0, 0, window.width(), window.height())`。
+4. 使用真实 `QMainWindow + QStatusBar`：登录覆盖层的父对象为 `central_widget`；初始显示及 resize 后几何均等于 `central_widget.rect()`；映射到主窗口后的覆盖区域等于 `central_widget.geometry()`，且不与状态栏几何相交。
 
-结果：`1 passed`。
+结果：`1 passed in 2.05s`。
 
-同一模块完整回归结果：`21 passed in 8.45s`。
+同一模块完整回归结果：`21 passed in 8.22s`。
 
 ## Offscreen / DPI 限制
 
@@ -40,7 +40,7 @@
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 全量测试 | `QT_QPA_PLATFORM=offscreen Python311.exe -m pytest -v` | `50 passed in 12.28s` |
+| 全量测试 | `QT_QPA_PLATFORM=offscreen Python311.exe -m pytest -v` | `50 passed in 12.87s` |
 | 静态检查 | `Python311.exe -m flake8 client tests --select=E9,F63,F7,F82` | 退出码 `0`，无输出 |
 | 差异检查 | `git diff --check` | 退出码 `0`，无输出 |
 | 暂存范围 | `git diff --name-only` 与未跟踪文件检查 | 仅暂存本 Task 允许修改的三个文件；既有 `MySQL_/sql配置.pptx` 修改不纳入提交 |

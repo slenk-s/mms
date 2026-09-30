@@ -141,9 +141,11 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
     script = textwrap.dedent(
         """
         import tempfile
-        from PySide6.QtCore import QRect
+        from PySide6.QtCore import QPoint, QRect
         from PySide6.QtTest import QTest
-        from PySide6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
+        from PySide6.QtWidgets import (
+            QApplication, QHBoxLayout, QMainWindow, QStatusBar, QVBoxLayout, QWidget,
+        )
         from main import MainWindow
         from utils import ui_settings
         from views.config_view import ConfigView
@@ -167,13 +169,21 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
         main_layout.setSpacing(0)
         window.nav_bar = NavigationBar()
         main_layout.addWidget(window.nav_bar)
+        window.status_bar = QStatusBar()
+        window.setStatusBar(window.status_bar)
+        window.sync_status_bar = QWidget(window.central_widget)
+        window.stacked_widget = QWidget(window.central_widget)
         window.content_area = QWidget()
         content_layout = QVBoxLayout(window.content_area)
         content_layout.setContentsMargins(0, 0, 0, 0)
         window.config_view = ConfigView()
         content_layout.addWidget(window.config_view)
         main_layout.addWidget(window.content_area)
-        window.login_view = QWidget(window.central_widget)
+        class LoginOverlay(QWidget):
+            def show_login(self):
+                self.show()
+
+        window.login_view = LoginOverlay(window.central_widget)
         window.login_view.hide()
         window.resize(1400, 900)
         window.show()
@@ -201,10 +211,20 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
         assert window.nav_bar.is_collapsed() is False
         assert window._navigation_auto_collapsed is False
 
-        window.login_view.show()
+        MainWindow._show_login_overlay(window)
+        settle_layout()
+        assert window.login_view.parentWidget() is window.central_widget
+        assert window.login_view.geometry() == window.central_widget.rect()
+
         window.resize(1099, 760)
         settle_layout()
-        assert window.login_view.geometry() == QRect(0, 0, window.width(), window.height())
+        assert window.login_view.geometry() == window.central_widget.rect()
+        overlay_in_window = QRect(
+            window.login_view.mapTo(window, QPoint(0, 0)),
+            window.login_view.size(),
+        )
+        assert overlay_in_window == window.central_widget.geometry()
+        assert not overlay_in_window.intersects(window.status_bar.geometry())
 
         window.login_view.hide()
         assert window.config_view.shutdown_for_application_exit(5000)

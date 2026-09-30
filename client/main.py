@@ -614,8 +614,8 @@ class MainWindow(QMainWindow):
             # 排队回调只在窗口、视图有效且模式不同的情况下调用其公开接口校正。
             self._schedule_responsive_layout_confirmation(width)
         if hasattr(self, "login_view") and self.login_view.isVisible():
-            # 覆盖整个窗口（含状态栏）
-            self.login_view.setGeometry(0, 0, self.width(), self.height())
+            # 覆盖中央内容区
+            self.login_view.setGeometry(self.central_widget.rect())
 
     def _connect_signals(self):
         # 导航
@@ -697,12 +697,12 @@ class MainWindow(QMainWindow):
     # ---------- 登录相关 ----------
 
     def _show_login_overlay(self):
-        """显示登录覆盖层 — 全屏覆盖主窗口"""
+        """显示登录覆盖层并覆盖中央内容区"""
         self.nav_bar.setVisible(False)
         self.sync_status_bar.setVisible(False)
         self.stacked_widget.setVisible(False)
-        # 覆盖整个窗口区域（含状态栏）
-        self.login_view.setGeometry(0, 0, self.width(), self.height())
+        # 覆盖中央内容区
+        self.login_view.setGeometry(self.central_widget.rect())
         self.login_view.show_login()
 
     def _try_auto_login(self) -> bool:
@@ -1099,8 +1099,8 @@ class MainWindow(QMainWindow):
         self.sync_status_bar.setVisible(False)
         self.stacked_widget.setVisible(False)
         self.nav_bar.clear_user_info()
-        # 全屏覆盖显示登录层
-        self.login_view.setGeometry(0, 0, self.width(), self.height())
+        # 覆盖中央内容区
+        self.login_view.setGeometry(self.central_widget.rect())
         self.login_view.show_login()
         self.status_bar.showMessage(tr("status.logged_out"))
 
