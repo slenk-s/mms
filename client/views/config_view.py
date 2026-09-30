@@ -820,7 +820,7 @@ class ConfigView(QWidget):
         self._refresh_status_value_displays()
 
     def _set_stat_grid_columns(self, columns: int):
-        """在不重建迷你统计卡片的前提下调整统计网格列数。"""
+        """在同一个统计网格中调整列数，保持布局和卡片对象稳定。"""
         positions = [
             self._stat_grid.getItemPosition(index)
             for index in range(self._stat_grid.count())
@@ -831,18 +831,10 @@ class ConfigView(QWidget):
         ):
             return
 
-        old_grid = self._stat_grid
-        while old_grid.count():
-            old_grid.takeAt(0)
-        self.card_stats.body().removeItem(old_grid)
-        old_grid.deleteLater()
-
-        self._stat_grid = QGridLayout()
-        self._stat_grid.setSpacing(8)
-        self._stat_grid.setContentsMargins(0, 0, 0, 0)
+        for card in self._mini_stats.values():
+            self._stat_grid.removeWidget(card)
         for index, card in enumerate(self._mini_stats.values()):
             self._stat_grid.addWidget(card, index // columns, index % columns)
-        self.card_stats.body().addLayout(self._stat_grid)
 
     def _refresh_status_value_displays(self):
         for card in (self.card_overview, self.card_mysql, self.card_sync, self.card_ftp):

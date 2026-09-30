@@ -229,6 +229,11 @@ def test_config_view_reflows_stats_and_workshop_controls_at_all_breakpoints(
     """三断点保持辅助卡片对象不变，并按要求排列统计和车间控件。"""
     view = visible_config_view
     mini_stats = tuple(view._mini_stats.values())
+    stat_layout_ids = (
+        id(view._stat_grid),
+        id(view.card_stats.layout()),
+        id(view.card_stats.body()),
+    )
     action_buttons = (view.btn_export, view.btn_import, view.btn_clear_queue)
     workshop_controls = (
         view.lbl_workshop,
@@ -240,6 +245,10 @@ def test_config_view_reflows_stats_and_workshop_controls_at_all_breakpoints(
         ("wide", 1250, Qt.Horizontal, Qt.Horizontal, 2, QBoxLayout.LeftToRight),
         ("medium", 900, Qt.Vertical, Qt.Vertical, 2, QBoxLayout.LeftToRight),
         ("narrow", 800, Qt.Vertical, Qt.Vertical, 1, QBoxLayout.TopToBottom),
+        (
+            "wide", 1250, Qt.Horizontal, Qt.Horizontal, 2,
+            QBoxLayout.LeftToRight,
+        ),
     )
     for mode, width, area_orientation, bottom_orientation, columns, workshop_orientation in expectations:
         view.resize(width, 900)
@@ -250,9 +259,22 @@ def test_config_view_reflows_stats_and_workshop_controls_at_all_breakpoints(
 
         assert view._horizontal_area.orientation() == area_orientation
         assert view._bottom_stack.orientation() == bottom_orientation
-        assert view._stat_grid.columnCount() == columns
+        actual_positions = tuple(
+            view._stat_grid.getItemPosition(index)[:2]
+            for index in range(view._stat_grid.count())
+        )
+        expected_positions = tuple(
+            (index // columns, index % columns)
+            for index in range(len(mini_stats))
+        )
+        assert actual_positions == expected_positions
         assert view._workshop_layout.direction() == workshop_orientation
         assert tuple(view._mini_stats.values()) == mini_stats
+        assert (
+            id(view._stat_grid),
+            id(view.card_stats.layout()),
+            id(view.card_stats.body()),
+        ) == stat_layout_ids
         assert all(button.isVisible() and button.height() > 0 for button in action_buttons)
         assert all(control.isVisible() and control.height() > 0 for control in workshop_controls)
 
