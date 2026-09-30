@@ -14,23 +14,13 @@ from PySide6.QtWidgets import (
 
 from config import IMAGES_DIR
 from i18n import tr
-from utils.ui_settings import restore_ui_preference, save_ui_preference
 
 
 class NavigationBar(QWidget):
     """左侧导航栏组件。"""
 
-    COLLAPSED_WIDTH = 68
     EXPANDED_MIN_WIDTH = 200
     EXPANDED_MAX_WIDTH = 240
-    NAV_ITEM_ICONS = {
-        "inventory": "📦",
-        "register": "📝",
-        "asset": "🏷️",
-        "config": "⚙️",
-        "user_manage": "👥",
-    }
-
     page_changed = Signal(str)
     logout_clicked = Signal()
 
@@ -41,25 +31,13 @@ class NavigationBar(QWidget):
         self._cached_username = ""
         self._cached_role = ""
         self._cached_lib_name = ""
-        self._collapsed = False
         self._init_ui()
-        self.set_collapsed(
-            restore_ui_preference("navigation_collapsed", False), persist=False
-        )
+        self._apply_expanded_presentation()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 16, 12, 16)
         layout.setSpacing(4)
-
-        self.collapse_button = QPushButton("☰")
-        self.collapse_button.setObjectName("navCollapseButton")
-        self.collapse_button.setToolTip(tr("nav.collapse"))
-        self.collapse_button.setAccessibleName(tr("nav.collapse"))
-        self.collapse_button.clicked.connect(
-            lambda: self.set_collapsed(not self.is_collapsed())
-        )
-        layout.addWidget(self.collapse_button)
 
         logo_label = QLabel()
         logo_label.setAlignment(Qt.AlignCenter)
@@ -137,40 +115,28 @@ class NavigationBar(QWidget):
         layout.addWidget(self.lib_label)
 
     def set_collapsed(self, collapsed: bool, persist: bool = True):
-        """切换导航栏折叠状态，并可选择保存用户偏好。"""
-        self._collapsed = bool(collapsed)
-        self._apply_collapsed_presentation()
-        if persist:
-            save_ui_preference("navigation_collapsed", self._collapsed)
+        """兼容旧调用；导航栏始终以完整文字展开显示。"""
+        self._apply_expanded_presentation()
 
     def is_collapsed(self) -> bool:
-        """返回导航栏当前是否处于折叠状态。"""
-        return self._collapsed
+        """导航栏不再支持折叠。"""
+        return False
 
-    def _apply_collapsed_presentation(self):
-        if self._collapsed:
-            self.setFixedWidth(self.COLLAPSED_WIDTH)
-        else:
-            self.setMinimumWidth(self.EXPANDED_MIN_WIDTH)
-            self.setMaximumWidth(self.EXPANDED_MAX_WIDTH)
-
+    def _apply_expanded_presentation(self):
+        self.setMinimumWidth(self.EXPANDED_MIN_WIDTH)
+        self.setMaximumWidth(self.EXPANDED_MAX_WIDTH)
         for page_id, button in self._buttons.items():
             label = tr(f"nav.{page_id}")
-            button.setText(
-                self.NAV_ITEM_ICONS[page_id] if self._collapsed else label
-            )
+            button.setText(label)
             button.setToolTip(label)
             button.setAccessibleName(label)
 
         logout_label = tr("nav.logout")
-        self.logout_btn.setText("" if self._collapsed else logout_label)
+        self.logout_btn.setText(logout_label)
         self.logout_btn.setToolTip(logout_label)
         self.logout_btn.setAccessibleName(logout_label)
-        self.user_label.setVisible(not self._collapsed)
-        self.lib_label.setVisible(not self._collapsed)
-        toggle_label = tr("nav.expand" if self._collapsed else "nav.collapse")
-        self.collapse_button.setToolTip(toggle_label)
-        self.collapse_button.setAccessibleName(toggle_label)
+        self.user_label.setVisible(True)
+        self.lib_label.setVisible(True)
 
     def _on_nav_clicked(self, page_id: str):
         """导航按钮点击事件。"""
@@ -226,4 +192,4 @@ class NavigationBar(QWidget):
             self.set_library_name(self._cached_lib_name)
         else:
             self.lib_label.setText(tr("nav.local_library", name="模组机架一组"))
-        self._apply_collapsed_presentation()
+        self._apply_expanded_presentation()

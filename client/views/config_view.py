@@ -758,7 +758,8 @@ class ConfigView(QWidget):
         if mode not in {"wide", "medium", "narrow"}:
             raise ValueError("responsive mode must be one of: wide, medium, narrow")
 
-        if mode == "narrow":
+        if mode in {"medium", "narrow"}:
+            # 内容区不足以并排承载配置与状态时，状态区下移并纵向排列。
             # 保持两个面板始终属于同一 splitter，只切换方向，避免 QWidget
             # 在 QSplitter 与普通布局之间重设父对象导致的销毁顺序问题。
             self._horizontal_area.setOrientation(Qt.Vertical)
@@ -797,9 +798,9 @@ class ConfigView(QWidget):
 
     @staticmethod
     def _responsive_mode_for_width(width: int) -> str:
-        if width >= 1400:
+        if width >= 1250:
             return "wide"
-        if width >= 1100:
+        if width >= 900:
             return "medium"
         return "narrow"
 

@@ -52,6 +52,7 @@ class DataTable(QWidget):
         self.table.setColumnCount(len(self.columns))
         self.table.setHorizontalHeaderLabels([c[0] for c in self.columns])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.horizontalHeader().setStretchLastSection(True)
         last_idx = len(self.columns) - 1
         self.table.horizontalHeader().setSectionResizeMode(last_idx, QHeaderView.Stretch)
@@ -207,16 +208,13 @@ class DataTable(QWidget):
                 self.table.setColumnWidth(col_idx, w)
 
         for row_idx, row_data in enumerate(page_data):
-            for col_idx, (_, key, _, align) in enumerate(self.columns):
+            for col_idx, (_, key, _, _) in enumerate(self.columns):
                 value = row_data.get(key, "")
                 item = QTableWidgetItem(str(value))
                 # 只在第一列存储完整数据，其余列不必重复
                 if col_idx == 0:
                     item.setData(Qt.UserRole, row_data)
-                if align == "center":
-                    item.setTextAlignment(Qt.AlignCenter)
-                elif align == "right":
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 self.table.setItem(row_idx, col_idx, item)
 
         # 恢复更新

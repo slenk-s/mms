@@ -51,7 +51,8 @@ class LoginView(QWidget):
         main_layout.setAlignment(Qt.AlignCenter)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        card = QFrame()
+        self.card = QFrame()
+        card = self.card
         card.setStyleSheet("""
             QFrame {
                 background-color: transparent;
@@ -139,7 +140,7 @@ class LoginView(QWidget):
         self.switch_btn.clicked.connect(self._toggle_mode)
         card_layout.addWidget(self.switch_btn)
 
-        main_layout.addWidget(card)
+        main_layout.addWidget(card, alignment=Qt.AlignHCenter | Qt.AlignVCenter)
 
         self.username_input.returnPressed.connect(self._on_action)
         self.password_input.returnPressed.connect(self._on_action)

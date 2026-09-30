@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QPoint
 from PySide6.QtWidgets import QApplication
 
 
@@ -19,6 +19,8 @@ from main import MainWindow
 from views.config_view import _FtpTestThread
 from utils import ui_settings
 from widgets.navigation import NavigationBar
+from widgets.data_table import DataTable
+from views.login_view import LoginView
 from views.config_view import ConfigView, StatusCard
 
 
@@ -52,82 +54,29 @@ def visible_config_view(qtbot):
     view.close()
 
 
-def test_navigation_collapses_and_expands_with_translated_tooltips(
+def test_navigation_always_shows_text_and_ignores_legacy_collapsed_preference(
     qtbot, isolated_ui_settings
 ):
-    """折叠保留可辨识图标与翻译辅助文本，展开后恢复信息。"""
+    """旧折叠偏好不得将导航栏恢复为图标栏。"""
+    ui_settings.save_ui_preference("navigation_collapsed", True)
     navigation = NavigationBar()
     qtbot.addWidget(navigation)
     navigation.set_user_info("Alice", "admin")
     navigation.set_library_name("测试库")
 
-    navigation.set_collapsed(True)
-
-    assert navigation.is_collapsed() is True
-    assert 64 <= navigation.minimumWidth() <= 72
-    assert 64 <= navigation.maximumWidth() <= 72
-    for page_id, button in navigation._buttons.items():
-        assert button.text() == NavigationBar.NAV_ITEM_ICONS[page_id]
-        assert button.toolTip() == tr(f"nav.{page_id}")
-        assert button.accessibleName() == tr(f"nav.{page_id}")
-    assert navigation.logout_btn.text() == ""
-    assert navigation.logout_btn.toolTip() == tr("nav.logout")
-    assert navigation.logout_btn.accessibleName() == tr("nav.logout")
-    assert navigation.user_label.isHidden()
-    assert navigation.lib_label.isHidden()
-
-    navigation.set_collapsed(False)
-
     assert navigation.is_collapsed() is False
+    assert not hasattr(navigation, "collapse_button")
     assert 200 <= navigation.minimumWidth() <= 240
     assert 200 <= navigation.maximumWidth() <= 240
     for page_id, button in navigation._buttons.items():
         assert button.text() == tr(f"nav.{page_id}")
         assert button.accessibleName() == tr(f"nav.{page_id}")
     assert navigation.logout_btn.text() == tr("nav.logout")
-    assert navigation.logout_btn.accessibleName() == tr("nav.logout")
-    assert navigation.user_label.text() == "👤 Alice\n[管理员]"
-    assert navigation.lib_label.text() == tr("nav.local_library", name="测试库")
-
-
-def test_collapse_button_uses_translated_tooltip_and_accessible_name(
-    qtbot, isolated_ui_settings
-):
-    """折叠开关应随语言和状态更新 Tooltip 与可访问名称。"""
-    navigation = NavigationBar()
-    qtbot.addWidget(navigation)
-
-    assert navigation.collapse_button.toolTip() == tr("nav.collapse")
-    assert navigation.collapse_button.accessibleName() == tr("nav.collapse")
+    assert not navigation.user_label.isHidden()
+    assert not navigation.lib_label.isHidden()
 
     navigation.set_collapsed(True)
-    assert navigation.collapse_button.toolTip() == tr("nav.expand")
-    assert navigation.collapse_button.accessibleName() == tr("nav.expand")
-
-    translations.set_current("es_ES")
-    navigation.retranslate_ui()
-    assert navigation.collapse_button.toolTip() == tr("nav.expand")
-    assert navigation.collapse_button.accessibleName() == tr("nav.expand")
-    for page_id, button in navigation._buttons.items():
-        assert button.text() == NavigationBar.NAV_ITEM_ICONS[page_id]
-        assert button.toolTip() == tr(f"nav.{page_id}")
-        assert button.accessibleName() == tr(f"nav.{page_id}")
-
-
-def test_navigation_collapsed_preference_is_saved_and_restored(
-    qtbot, isolated_ui_settings
-):
-    """NavigationBar 保存折叠偏好，并由新实例恢复。"""
-    navigation = NavigationBar()
-    qtbot.addWidget(navigation)
-
-    navigation.set_collapsed(True)
-
-    assert ui_settings.restore_ui_preference("navigation_collapsed", False) is True
-
-    restored_navigation = NavigationBar()
-    qtbot.addWidget(restored_navigation)
-    assert restored_navigation.is_collapsed() is True
+    assert navigation.is_collapsed() is False
 
 
 def test_ui_preference_returns_default_without_saved_value(isolated_ui_settings):
@@ -141,7 +90,7 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
     script = textwrap.dedent(
         """
         import tempfile
-        from PySide6.QtCore import QPoint, QRect
+        from PySide6.QtCore import QPoint, QRect, Qt
         from PySide6.QtTest import QTest
         from PySide6.QtWidgets import (
             QApplication, QHBoxLayout, QMainWindow, QStatusBar, QVBoxLayout, QWidget,
@@ -160,7 +109,6 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
             app.processEvents()
         window = MainWindow.__new__(MainWindow)
         QMainWindow.__init__(window)
-        window._navigation_auto_collapsed = False
 
         window.central_widget = QWidget()
         window.setCentralWidget(window.central_widget)
@@ -189,34 +137,22 @@ def test_main_window_responsive_layout_uses_real_offscreen_qt():
         window.show()
         settle_layout()
 
-        assert window._responsive_mode_for_width(1400) == "wide"
-        assert window._responsive_mode_for_width(1399) == "medium"
-        assert window._responsive_mode_for_width(1099) == "narrow"
-        for width, expected_mode in ((1400, "wide"), (1399, "medium"), (1099, "narrow")):
+        assert window._responsive_mode_for_width(1250) == "wide"
+        assert window._responsive_mode_for_width(1249) == "medium"
+        assert window._responsive_mode_for_width(899) == "narrow"
+        for width, expected_mode in ((1500, "wide"), (1264, "medium"), (1099, "narrow")):
             window.resize(width, 900)
             settle_layout()
             assert window.central_widget.contentsRect().width() == width
-            assert window.config_view._responsive_mode == expected_mode
+            assert window.config_view._responsive_mode == expected_mode, (width, window.content_area.contentsRect().width(), window.config_view._responsive_mode)
 
-        window.resize(1400, 900)
+        window.resize(1264, 900)
         settle_layout()
-        assert window.config_view._responsive_mode == "wide"
-        for collapsed in (True, False):
-            window.nav_bar.set_collapsed(collapsed, persist=False)
-            settle_layout()
-            assert window.central_widget.contentsRect().width() == 1400
-            assert window.config_view._responsive_mode == "wide"
-
-        window.nav_bar.set_collapsed(False)
-        window.resize(1099, 900)
-        settle_layout()
-        assert window.nav_bar.is_collapsed() is True
-        assert window._navigation_auto_collapsed is True
-        assert ui_settings.restore_ui_preference("navigation_collapsed", True) is False
-        window.resize(1400, 900)
-        settle_layout()
+        assert window.config_view._responsive_mode == "medium"
+        assert window.config_view._horizontal_area.orientation() == Qt.Vertical
+        assert window.config_view._bottom_stack.orientation() == Qt.Vertical
         assert window.nav_bar.is_collapsed() is False
-        assert window._navigation_auto_collapsed is False
+        assert not hasattr(window.nav_bar, "collapse_button")
 
         MainWindow._show_login_overlay(window)
         settle_layout()
@@ -267,9 +203,10 @@ def test_config_view_reflows_existing_containers_without_recreating_controls(vis
 
     view.set_responsive_mode("medium")
     assert status_panel.parentWidget() is view._horizontal_area
-    assert view._horizontal_area.orientation() == Qt.Horizontal
-    assert view._bottom_stack.orientation() == Qt.Horizontal
-    assert view._horizontal_area.sizes()[0] > view._horizontal_area.sizes()[1]
+    assert view._horizontal_area.orientation() == Qt.Vertical
+    assert view._horizontal_area.indexOf(view._config_panel) == 0
+    assert view._horizontal_area.indexOf(status_panel) == 1
+    assert view._bottom_stack.orientation() == Qt.Vertical
 
     view.set_responsive_mode("narrow")
     assert status_panel.parentWidget() is view._horizontal_area
@@ -291,7 +228,7 @@ def test_config_view_resize_selects_breakpoint_mode_only_when_it_changes(
 ):
     """生产 resizeEvent 根据宽度切换模式，并避免同模式重复重排。"""
     view = visible_config_view
-    view.resize(1400, 700)
+    view.resize(1250, 700)
     QApplication.processEvents()
     assert view._responsive_mode == "wide"
 
@@ -304,15 +241,15 @@ def test_config_view_resize_selects_breakpoint_mode_only_when_it_changes(
 
     monkeypatch.setattr(view, "set_responsive_mode", record_mode)
 
-    view.resize(1399, 700)
+    view.resize(1249, 700)
     QApplication.processEvents()
     assert view._responsive_mode == "medium"
 
-    view.resize(1200, 700)
+    view.resize(900, 700)
     QApplication.processEvents()
     assert view._responsive_mode == "medium"
 
-    view.resize(1099, 700)
+    view.resize(899, 700)
     QApplication.processEvents()
     assert view._responsive_mode == "narrow"
     assert calls == ["medium", "narrow"]
@@ -673,3 +610,33 @@ def test_status_card_elides_long_value_and_keeps_full_tooltip(qtbot):
     QApplication.processEvents()
     assert value_label.wordWrap() is True
     assert value_label.text() == "诊断内容：" + full_value
+
+
+def test_login_card_is_centered_at_common_overlay_widths(qtbot):
+    """登录卡片必须在覆盖层内水平和垂直居中。"""
+    view = LoginView()
+    qtbot.addWidget(view)
+    for width in (800, 1280):
+        view.resize(width, 720)
+        view.show()
+        QApplication.processEvents()
+        card_center = view.card.geometry().center()
+        overlay_center = view.rect().center()
+        assert abs(card_center.x() - overlay_center.x()) <= 2
+        assert abs(card_center.y() - overlay_center.y()) <= 2
+    view.close()
+
+
+def test_data_table_headers_and_cells_are_always_left_aligned(qtbot):
+    """业务表格不再保留原列定义中的居中或右对齐。"""
+    table = DataTable(
+        [("名称", "name", 120, "center"), ("数量", "count", 90, "right")],
+        table_id="alignment-test",
+    )
+    qtbot.addWidget(table)
+    table.set_data([{ "name": "电阻", "count": 12 }])
+
+    expected = Qt.AlignLeft | Qt.AlignVCenter
+    assert table.table.horizontalHeader().defaultAlignment() == expected
+    for column in range(table.table.columnCount()):
+        assert table.table.item(0, column).textAlignment() == expected
