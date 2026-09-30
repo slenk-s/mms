@@ -116,8 +116,8 @@ BTN_WARN = """
 # ==================== MySQL 连接棢测工作线====================
 
 class MySQLTestThread(QThread):
-    """后台线程执行 MySQL 连接测试，完成后发射信号"""
-    test_finished = Signal(bool, str)  # (is_online, detail)
+    """带有限网络超时并支持取消检查的 MySQL 连接测试线程。"""
+    test_finished = Signal(bool, str)
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  database: str, charset: str, parent=None):
@@ -129,48 +129,61 @@ class MySQLTestThread(QThread):
         self._database = database
         self._charset = charset
 
+    def _emit_result(self, is_online: bool, detail: str):
+        if not self.isInterruptionRequested():
+            self.test_finished.emit(is_online, detail)
+
     def run(self):
+        conn = None
         try:
+            if self.isInterruptionRequested():
+                return
             import pymysql
             from pymysql.cursors import DictCursor
             conn = pymysql.connect(
-                host=self._host, port=self._port,
-                user=self._user, password=self._password,
-                database=self._database, charset=self._charset,
-                cursorclass=DictCursor, autocommit=True,
-                connect_timeout=3,
+                host=self._host, port=self._port, user=self._user,
+                password=self._password, database=self._database,
+                charset=self._charset, cursorclass=DictCursor, autocommit=True,
+                connect_timeout=3, read_timeout=3, write_timeout=3,
             )
+            if self.isInterruptionRequested():
+                return
             with conn.cursor() as cur:
                 cur.execute("SELECT VERSION()")
                 version = cur.fetchone()["VERSION()"]
-            conn.close()
-            self.test_finished.emit(True, version)
-        except (pymysql.err.OperationalError, pymysql.err.ProgrammingError, OSError, RuntimeError) as e:
-            self.test_finished.emit(False, str(e)[:200])
-        except Exception as e:
-            _log.warning("MySQL 测试线程未预期异 %s", e)
-            self.test_finished.emit(False, str(e)[:200])
+            self._emit_result(True, version)
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self._emit_result(False, str(exc)[:200])
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 class PortCheckThread(QThread):
-    """后台线程执行端口棢测，避免阻塞主线程（未监听时 connect_ex 会等待超时）"""
-    check_finished = Signal(int, bool)  # (port, is_in_use)
+    """带有限 socket 超时并支持取消检查的端口检测线程。"""
+    check_finished = Signal(int, bool)
 
     def __init__(self, port: int, timeout: float = 0.05, parent=None):
         super().__init__(parent)
         self._port = port
-        self._timeout = timeout
+        self._timeout = min(max(timeout, 0.01), 0.5)
 
     def run(self):
         import socket
+        if self.isInterruptionRequested():
+            return
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self._timeout)
-                result = s.connect_ex(("127.0.0.1", self._port))
-                in_use = (result == 0)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self._timeout)
+                in_use = sock.connect_ex(("127.0.0.1", self._port)) == 0
         except Exception:
             in_use = False
-        self.check_finished.emit(self._port, in_use)
+        if not self.isInterruptionRequested():
+            self.check_finished.emit(self._port, in_use)
 
 
 class ConfigGroup(QFrame):
@@ -1638,7 +1651,10 @@ class ConfigView(QWidget):
             if self._port_check_thread is not None:
                 self._port_check_thread = None
             self._port_check_thread = PortCheckThread(port, timeout=0.5, parent=self)
-            self._port_check_thread.check_finished.connect(self._on_port_check_finished)
+            self._port_check_thread.check_finished.connect(
+                lambda checked_port, in_use, thread=self._port_check_thread:
+                self._on_port_check_finished(checked_port, in_use, thread)
+            )
             self._port_check_thread.finished.connect(
                 lambda thread=self._port_check_thread: self._clear_finished_thread(
                     "_port_check_thread", thread
@@ -1650,8 +1666,12 @@ class ConfigView(QWidget):
         finally:
             self._is_syncing_web_status = False
 
-    def _on_port_check_finished(self, port: int, is_in_use: bool):
-        """端口棢测完成回调（来自后台线程"""
+    def _on_port_check_finished(self, port: int, is_in_use: bool, source_thread=None):
+        """仅接收当前端口检测线程的结果，避免旧线程覆盖 UI。"""
+        if self._is_disposed or (
+            source_thread is not None and self._port_check_thread is not source_thread
+        ):
+            return
         try:
             # 仅当端口配置未变更时才应用检测结果（避免用户改了端口后旧结果覆盖
             current_port = self.web_port.value()
@@ -2258,7 +2278,9 @@ class ConfigView(QWidget):
                 toast_success(self, tr("toast.test_success", detail=detail), 3000)
             else:
                 toast_error(self, tr("toast.test_fail", detail=detail), 4000)
-            self._on_mysql_test_result(is_online, detail)
+            if self._mysql_test_thread is not thread or self._is_disposed:
+                return
+            self._on_mysql_test_result(is_online, detail, thread)
 
         thread.test_finished.connect(_on_result)
         thread.finished.connect(
@@ -2448,14 +2470,22 @@ class ConfigView(QWidget):
             database=database, charset=charset, parent=self
         )
         self._mysql_test_thread = thread
-        thread.test_finished.connect(self._on_mysql_test_result)
+        thread.test_finished.connect(
+            lambda is_online, detail, thread=thread: self._on_mysql_test_result(
+                is_online, detail, thread
+            )
+        )
         thread.finished.connect(
             lambda thread=thread: self._cleanup_mysql_thread(thread)
         )
         thread.start()
 
-    def _on_mysql_test_result(self, is_online: bool, detail: str):
-        """MySQL 棢测完成的回调（在主线程执行，安全更新 UI"""
+    def _on_mysql_test_result(self, is_online: bool, detail: str, source_thread=None):
+        """仅接收当前 MySQL 线程的结果，避免旧线程覆盖 UI。"""
+        if self._is_disposed or (
+            source_thread is not None and self._mysql_test_thread is not source_thread
+        ):
+            return
         self.card_mysql.set_status_row("status", tr("config.status_online") if is_online else tr("config.status_offline"), is_online)
 
         host = self.db_host.text().strip() or ""
@@ -2506,14 +2536,22 @@ class ConfigView(QWidget):
             host, port, user, password, directory=cfg.get("directory", ""), parent=self
         )
         self._ftp_test_thread = thread
-        thread.test_finished.connect(self._on_ftp_test_result)
+        thread.test_finished.connect(
+            lambda is_online, detail, thread=thread: self._on_ftp_test_result(
+                is_online, detail, thread
+            )
+        )
         thread.finished.connect(
             lambda thread=thread: self._cleanup_ftp_thread(thread)
         )
         thread.start()
 
-    def _on_ftp_test_result(self, is_online: bool, detail: str):
-        """FTP 棢测完成的回调"""
+    def _on_ftp_test_result(self, is_online: bool, detail: str, source_thread=None):
+        """仅接收当前 FTP 线程的结果，避免旧线程覆盖 UI。"""
+        if self._is_disposed or (
+            source_thread is not None and self._ftp_test_thread is not source_thread
+        ):
+            return
         if is_online:
             self.card_ftp.set_status_row("status", tr("config.status_online"), True)
             self.card_ftp.clear_row("error")
@@ -2802,16 +2840,24 @@ class ConfigView(QWidget):
         if getattr(self, attribute, None) is thread:
             setattr(self, attribute, None)
 
+    @staticmethod
+    def _thread_is_running(thread) -> bool:
+        try:
+            return thread is not None and thread.isRunning()
+        except (RuntimeError, AttributeError):
+            return False
+
     def _request_thread_stop(self, attribute: str):
         """协作式请求线程退出；运行中的线程由 finished 信号负责释放引用。"""
         thread = getattr(self, attribute, None)
         if thread is None:
             return
         try:
-            if thread.isRunning():
+            if self._thread_is_running(thread):
+                thread.requestInterruption()
                 thread.quit()
                 return
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
             pass
         setattr(self, attribute, None)
 
@@ -2846,13 +2892,46 @@ class ConfigView(QWidget):
         self._cleanup_web_process(sync_status=False)
 
     def dispose(self):
-        """确定性释放页面后台资源，不触发新的状态同步或后台线程。"""
+        """页面隐藏/切换使用的非阻塞清理：仅请求协作式取消。"""
         self._is_disposed = True
         self._stop_status_timer()
         self._cleanup_mysql_test_thread()
         self._cleanup_port_check_thread()
         self._cleanup_ftp_test_thread()
         self._cleanup_web_process(sync_status=False)
+
+    def shutdown_for_application_exit(self, timeout_ms: int = 5000) -> bool:
+        """应用最终退出路径：请求取消后进行总时长受限的线程等待。"""
+        self.dispose()
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+        for attribute in (
+            "_mysql_test_thread", "_port_check_thread", "_ftp_test_thread"
+        ):
+            thread = getattr(self, attribute, None)
+            if thread is None:
+                continue
+            try:
+                if self._thread_is_running(thread):
+                    remaining = max(0, int((deadline - time.monotonic()) * 1000))
+                    if remaining:
+                        thread.wait(remaining)
+                if not self._thread_is_running(thread):
+                    self._clear_finished_thread(attribute, thread)
+            except (RuntimeError, AttributeError):
+                setattr(self, attribute, None)
+        return not any(
+            self._thread_is_running(getattr(self, attribute, None))
+            for attribute in (
+                "_mysql_test_thread", "_port_check_thread", "_ftp_test_thread"
+            )
+        )
+
+    def closeEvent(self, event):
+        """显式关闭配置页时走应用退出级清理，页面 hide 仍保持非阻塞。"""
+        if self.shutdown_for_application_exit():
+            event.accept()
+        else:
+            event.ignore()
 
     # ==================== 车间管理 ====================
 
@@ -3108,20 +3187,34 @@ class _FtpTestThread(QThread):
         self.password = password
         self.directory = directory
 
+    def _emit_result(self, is_online: bool, detail: str):
+        if not self.isInterruptionRequested():
+            self.test_finished.emit(is_online, detail)
+
     def run(self):
+        ftp = None
         try:
+            if self.isInterruptionRequested():
+                return
             from utils.updater import _connect_ftp, _close_ftp
             ftp, _, status = _connect_ftp({
                 "host": self.host, "port": self.port,
                 "user": self.user, "pass": self.password,
                 "directory": self.directory,
             })
+            if self.isInterruptionRequested():
+                return
             if ftp is not None:
-                _close_ftp(ftp)
-                self.test_finished.emit(True, "")
+                self._emit_result(True, "")
             elif status == "NO_FILES":
-                self.test_finished.emit(True, "")
+                self._emit_result(True, "")
             else:
-                self.test_finished.emit(False, "连接失败")
-        except Exception as e:
-            self.test_finished.emit(False, str(e))
+                self._emit_result(False, "连接失败")
+        except Exception as exc:
+            self._emit_result(False, str(exc))
+        finally:
+            if ftp is not None:
+                try:
+                    _close_ftp(ftp)
+                except Exception:
+                    pass

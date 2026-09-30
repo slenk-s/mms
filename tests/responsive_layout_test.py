@@ -1,5 +1,8 @@
 """导航栏折叠状态与 UI 偏好持久化测试。"""
+import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -224,6 +227,10 @@ class _UnstoppableThread:
         self.quit_calls = 0
         self.wait_calls = 0
         self.terminate_calls = 0
+        self.interruption_requests = 0
+
+    def requestInterruption(self):
+        self.interruption_requests += 1
 
     def isRunning(self):
         return True
@@ -263,6 +270,7 @@ def test_cleanup_running_thread_requests_quit_without_wait_or_terminate(qtbot):
 
     view._cleanup_mysql_test_thread()
 
+    assert thread.interruption_requests == 1
     assert thread.quit_calls == 1
     assert thread.wait_calls == 0
     assert thread.terminate_calls == 0
@@ -293,6 +301,66 @@ def test_ftp_finished_cleanup_keeps_replacement_thread(qtbot):
     view._cleanup_ftp_thread(thread_a)
 
     assert view._ftp_test_thread is thread_b
+
+
+def test_old_thread_results_do_not_update_replacement_thread_ui(qtbot, monkeypatch):
+    """A 的迟到结果不能覆盖已替换为 B 的 MySQL、FTP 或端口状态。"""
+    view = ConfigView()
+    qtbot.addWidget(view)
+    source_thread = object()
+
+    mysql_updates = []
+    ftp_updates = []
+    port_updates = []
+    monkeypatch.setattr(
+        view.card_mysql, "set_status_row", lambda *args: mysql_updates.append(args)
+    )
+    monkeypatch.setattr(
+        view.card_ftp, "set_status_row", lambda *args: ftp_updates.append(args)
+    )
+    monkeypatch.setattr(
+        view, "_update_web_service_ui", lambda value: port_updates.append(value)
+    )
+
+    view._mysql_test_thread = object()
+    view._ftp_test_thread = object()
+    view._port_check_thread = object()
+    view._on_mysql_test_result(True, "old", source_thread)
+    view._on_ftp_test_result(True, "old", source_thread)
+    view._on_port_check_finished(view.web_port.value(), True, source_thread)
+
+    assert mysql_updates == []
+    assert ftp_updates == []
+    assert port_updates == []
+
+
+def test_visible_config_view_dispose_and_exit_without_native_thread_crash():
+    """真实离屏子进程显示页面后立即清理并退出，不得遗留运行线程。"""
+    script = textwrap.dedent(
+        """
+        from PySide6.QtWidgets import QApplication
+        from views.config_view import ConfigView
+
+        app = QApplication([])
+        view = ConfigView()
+        view.resize(1280, 900)
+        view.show()
+        app.processEvents()
+        view.clear_memory()
+        assert view.shutdown_for_application_exit(5000)
+        view.close()
+        app.processEvents()
+        """
+    )
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = str(CLIENT_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        timeout=15, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_config_view_dispose_stops_status_timer_and_threads(qtbot):
