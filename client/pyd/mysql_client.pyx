@@ -458,7 +458,8 @@ class MySQLClient:
             raise
 
     def apply_sync_operation(self, operation_id: str, table_name: str,
-                             operation: str, record_id: str, payload: Dict) -> str:
+                             operation: str, record_id: str, payload: Dict,
+                             allow_missing: bool = False) -> str:
         """原子应用一条同步操作，并以 ``operation_id`` 保证幂等。
 
         业务写入与 ``MMS_SyncOperationLog`` 的成功日志处于同一个 MySQL
@@ -496,7 +497,7 @@ class MySQLClient:
                     raise
 
                 self._execute_sync_business_write(
-                    cur, table_name, operation, record_id, payload
+                    cur, table_name, operation, record_id, payload, allow_missing
                 )
             self._conn.commit()
             return "applied"
@@ -552,7 +553,8 @@ class MySQLClient:
                 raise ValueError("不安全的 MySQL 列名: %s" % column)
 
     def _execute_sync_business_write(self, cur, table_name: str, operation: str,
-                                     record_id: str, payload: Dict):
+                                     record_id: str, payload: Dict,
+                                     allow_missing: bool = False):
         """执行严格业务写入；不将 INSERT/UPDATE 自动转换为另一种操作。"""
         if operation == "INSERT":
             data = dict(payload)
@@ -576,6 +578,8 @@ class MySQLClient:
                 params,
             )
             if cur.fetchone() is None:
+                if allow_missing:
+                    return
                 raise ValueError("UPDATE 目标记录不存在，不能自动合并")
             sets = ", ".join("`%s` = %%s" % column for column in payload)
             cur.execute(

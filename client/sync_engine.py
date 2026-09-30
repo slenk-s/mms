@@ -24,6 +24,7 @@ SYNC_APPLIED = "applied"
 SYNC_ALREADY_APPLIED = "already_applied"
 SYNC_RETRYABLE_ERROR = "retryable_error"
 SYNC_FAILED_ERROR = "failed_error"
+SYNC_CONFLICT = "conflict"
 SYNC_RETRY_BACKOFF_BASE_SECONDS = 5
 SYNC_RETRY_BACKOFF_MAX_SECONDS = 300
 
@@ -48,7 +49,7 @@ def _next_retry_at(item: Dict, now) -> str:
 
 def confirm_sync_results(local_db, results: list, now=None) -> Dict[str, int]:
     """在主线程确认已领取的同步结果，不删除队列操作记录。"""
-    summary = {"succeeded": 0, "retryable": 0, "failed": 0}
+    summary = {"succeeded": 0, "retryable": 0, "failed": 0, "conflicts": []}
     for result in results or []:
         item = result.get("item", {})
         operation_id = item.get("operation_id")
@@ -57,6 +58,14 @@ def confirm_sync_results(local_db, results: list, now=None) -> Dict[str, int]:
         error = result.get("error") or outcome or "未知同步错误"
         if not operation_id or not batch_id:
             _log.error("忽略缺少 operation_id 或 batch_id 的同步结果: %r", result)
+            continue
+
+        if outcome == SYNC_CONFLICT:
+            if local_db.mark_sync_succeeded(operation_id, batch_id):
+                conflict_info = result.get("conflict_info")
+                if conflict_info:
+                    summary["conflicts"].append(conflict_info)
+                summary["succeeded"] += 1
             continue
 
         if outcome in {SYNC_APPLIED, SYNC_ALREADY_APPLIED}:
@@ -139,7 +148,7 @@ class SyncWorker(QObject):
         self._ensure_init()
         results = [self._process_item(item) for item in queue_items]
         total = sum(
-            result["outcome"] in {SYNC_APPLIED, SYNC_ALREADY_APPLIED}
+            result["outcome"] in {SYNC_APPLIED, SYNC_ALREADY_APPLIED, SYNC_CONFLICT}
             for result in results
         )
         self.push_result.emit(results, total, "")
@@ -182,12 +191,66 @@ class SyncWorker(QObject):
     # ---------- 内部处理 ----------
 
     def _process_item(self, item: Dict) -> Dict:
-        """将一条已领取队列项交给 MySQL 幂等事务接口处理。"""
+        """在幂等写入前读取云端版本，保留既有冲突检测语义。"""
+        table = item.get("table_name")
+        operation = item.get("operation")
+        record_id = item.get("record_id")
         try:
             payload = json.loads(item["payload"])
+            effective_operation = operation
+            effective_record_id = record_id
+            effective_payload = payload
+            allow_missing = False
+
+            if operation == "INSERT":
+                existing = self._mysql.fetch_by_id(table, record_id)
+                if existing:
+                    conflict = self._check_conflict(table, record_id, existing, payload)
+                    if conflict:
+                        return {
+                            "item": item, "outcome": SYNC_CONFLICT,
+                            "error": "", "conflict_info": conflict,
+                        }
+                    effective_operation = "UPDATE"
+                else:
+                    # 业务唯一字段查重（如 asset_no / material_code）。
+                    biz_key, biz_col = self._get_biz_unique_key(table, payload)
+                    if biz_key and biz_col:
+                        duplicates = self._mysql.fetch_by_condition(table, biz_col, biz_key)
+                        if duplicates:
+                            duplicate_id = duplicates[0].get("id", record_id)
+                            conflict = self._check_conflict(
+                                table, duplicate_id, duplicates[0], payload
+                            )
+                            if conflict:
+                                return {
+                                    "item": item, "outcome": SYNC_CONFLICT,
+                                    "error": "", "conflict_info": conflict,
+                                }
+                            effective_operation = "UPDATE"
+                            effective_record_id = duplicate_id
+                            effective_payload = dict(payload)
+                            effective_payload["id"] = duplicate_id
+            elif operation == "UPDATE":
+                existing = self._mysql.fetch_by_id(table, record_id)
+                if existing:
+                    conflict = self._check_conflict(table, record_id, existing, payload)
+                    if conflict:
+                        return {
+                            "item": item, "outcome": SYNC_CONFLICT,
+                            "error": "", "conflict_info": conflict,
+                        }
+                elif self._mysql.is_connected():
+                    # 保持旧行为：远端记录已不存在时不重建它；仍记录 operation_id。
+                    allow_missing = True
+                else:
+                    effective_operation = "INSERT"
+            elif operation != "DELETE":
+                raise ValueError("不支持的同步操作: %s" % operation)
+
             outcome = self._mysql.apply_sync_operation(
-                item["operation_id"], item["table_name"], item["operation"],
-                item["record_id"], payload,
+                item["operation_id"], table, effective_operation,
+                effective_record_id, effective_payload, allow_missing=allow_missing,
             )
             if outcome not in {
                 SYNC_APPLIED, SYNC_ALREADY_APPLIED,
@@ -497,6 +560,37 @@ class SyncEngine(QObject):
             self.local_db.add_sync_log("push", "partial", summary["succeeded"], detail)
         elif summary["succeeded"]:
             self.local_db.add_sync_log("push", "success", summary["succeeded"])
+
+        # 三路合并处理冲突：无基线或同字段冲突时保持云端优先。
+        conflict_tables = set()
+        for conflict in summary["conflicts"]:
+            table = conflict["table"]
+            record_id = conflict["record_id"]
+            cloud_record = conflict["cloud"]
+            local_payload = conflict["local"]
+            base = self.local_db.get_snapshot(table, record_id)
+            if base:
+                merge_result = self._three_way_merge(base, local_payload, cloud_record)
+                if merge_result["action"] == "merge":
+                    merged = self._convert_record(merge_result["merged"])
+                    self.local_db.update(table, record_id, merged)
+                    self.local_db.save_snapshot(table, record_id, merged)
+                    _log.info("三路合并自动合并: %s/%s", table, record_id)
+                    continue
+                if merge_result["action"] == "noop":
+                    self.local_db.save_snapshot(
+                        table, record_id, self._convert_record(cloud_record)
+                    )
+                    continue
+                _log.info("检测到真正冲突，云端版本优先: %s/%s 冲突字段: %s",
+                          table, record_id, merge_result.get("fields", []))
+
+            conflict_tables.add(table)
+            self.local_db.update(table, record_id, self._convert_record(cloud_record))
+            self.local_db.save_snapshot(table, record_id, self._convert_record(cloud_record))
+
+        if conflict_tables:
+            self.batch_conflict_detected.emit({"tables": list(conflict_tables)})
 
         self.queue_updated.emit(self.local_db.get_sync_queue_count())
         self._start_pull()

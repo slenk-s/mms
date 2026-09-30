@@ -5,12 +5,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "client"))
 
+from config import TABLE_MATERIALS
 from local_db import LocalDB
-from sync_engine import SyncWorker, confirm_sync_results
+from sync_engine import SyncEngine, SyncWorker, confirm_sync_results
 
 
 class FakeMySQL:
@@ -20,8 +22,17 @@ class FakeMySQL:
         self.result = result
         self.calls = []
 
-    def apply_sync_operation(self, operation_id, table_name, operation, record_id, payload):
-        self.calls.append((operation_id, table_name, operation, record_id, payload))
+    def fetch_by_id(self, table_name, record_id):
+        return None
+
+    def fetch_by_condition(self, table_name, column, value):
+        return []
+
+    def is_connected(self):
+        return True
+
+    def apply_sync_operation(self, operation_id, table_name, operation, record_id, payload, **kwargs):
+        self.calls.append((operation_id, table_name, operation, record_id, payload, kwargs))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -38,10 +49,10 @@ def local_db(tmp_path: Path):
 
 def _claimed_item(db: LocalDB, operation_id: str):
     db.enqueue_sync_operation(
-        table_name="MMS_Materials",
+        table_name=TABLE_MATERIALS,
         operation="UPDATE",
         record_id="material-1",
-        payload={"id": "material-1", "name": "测试物料"},
+        payload={"id": "material-1", "material_name": "测试物料"},
         operation_id=operation_id,
     )
     return db.claim_sync_batch(now="2026-09-29T10:00:00")[0]
@@ -64,8 +75,8 @@ def test_applied_results_confirm_success_without_changing_operation_id(
 
     updated = local_db.get_sync_queue_item(item["id"])
     assert fake.calls == [(
-        item["operation_id"], "MMS_Materials", "UPDATE", "material-1",
-        {"id": "material-1", "name": "测试物料"},
+        item["operation_id"], TABLE_MATERIALS, "UPDATE", "material-1",
+        {"id": "material-1", "material_name": "测试物料"}, {"allow_missing": True},
     )]
     assert updated["status"] == expected_status
     assert updated["operation_id"] == item["operation_id"]
@@ -99,3 +110,63 @@ def test_non_retryable_error_becomes_failed_without_changing_operation_id(local_
     assert updated["status"] == "failed"
     assert updated["operation_id"] == "op-invalid"
     assert updated["attempt_count"] == 0
+
+
+class ConflictFakeMySQL(FakeMySQL):
+    def __init__(self):
+        super().__init__("applied")
+        self.cloud_record = {
+            "id": "material-1", "material_name": "云端新名称",
+            "updated_at": "2026-09-29T11:00:00",
+        }
+
+    def fetch_by_id(self, table_name, record_id):
+        return self.cloud_record
+
+    def is_connected(self):
+        return True
+
+
+def test_newer_cloud_update_returns_conflict_without_business_write(local_db: LocalDB):
+    item = _claimed_item(local_db, "op-cloud-newer")
+    payload = {"id": "material-1", "material_name": "本地旧名称", "updated_at": "2026-09-29T10:00:00"}
+    with local_db._connect() as conn:
+        conn.execute("UPDATE sync_queue SET payload = ? WHERE id = ?", (
+            __import__("json").dumps(payload, ensure_ascii=False), item["id"],
+        ))
+    item = local_db.get_sync_queue_item(item["id"])
+    worker = SyncWorker()
+    fake = ConflictFakeMySQL()
+    worker._mysql = fake
+
+    result = worker._process_item(item)
+
+    assert result["outcome"] == "conflict"
+    assert result["conflict_info"]["cloud"] == fake.cloud_record
+    assert fake.calls == []
+
+
+def test_conflict_result_keeps_three_way_conflict_notification(local_db: LocalDB):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    item = _claimed_item(local_db, "op-conflict-notification")
+    worker = SyncWorker()
+    fake = ConflictFakeMySQL()
+    worker._mysql = fake
+    payload = {"id": "material-1", "material_name": "本地旧名称", "updated_at": "2026-09-29T10:00:00"}
+    with local_db._connect() as conn:
+        conn.execute("UPDATE sync_queue SET payload = ? WHERE id = ?", (
+            __import__("json").dumps(payload, ensure_ascii=False), item["id"],
+        ))
+    item = local_db.get_sync_queue_item(item["id"])
+    result = worker._process_item(item)
+    engine = SyncEngine(None, local_db)
+    notifications = []
+    engine.batch_conflict_detected.connect(notifications.append)
+    engine._start_pull = lambda: None
+    try:
+        engine._on_worker_push_result([result], 1, "")
+        assert local_db.get_sync_queue_item(item["id"])["status"] == "succeeded"
+        assert notifications == [{"tables": [TABLE_MATERIALS]}]
+    finally:
+        engine.stop()
+    assert app is not None
