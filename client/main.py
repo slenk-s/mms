@@ -1628,9 +1628,10 @@ class MainWindow(QMainWindow):
         self.sync_engine.offline_delete(TABLE_FIXED_ASSETS, asset_id, add_to_queue=self._sync_queue_enabled)
         self._refresh_current_view("asset")
 
-    def _refresh_current_view(self):
-        """仅刷新当前视图的数据（避免全量加载所有表）"""
-        self._load_data_for_page(self._current_page)
+    def _refresh_current_view(self, *invalidated_pages: str):
+        """使相关页面快照失效，并异步重载当前视图。"""
+        self._invalidate_page_cache(*(invalidated_pages or (self._current_page,)))
+        self._request_page_load(self._current_page, force=True)
 
     def _refresh_return_row(self, record_id: str, updates: dict):
         """原地更新领用记录的一行，不重绘整页"""
@@ -1830,6 +1831,10 @@ class MainWindow(QMainWindow):
         self.asset_view.clear_memory()
         self.user_manage_view.clear_memory()
         self.config_view.clear_memory()
+        # 页面读取线程必须结束后才能销毁窗口，避免 QThread still running。
+        for worker in tuple(self._page_workers.values()):
+            worker.wait(5000)
+        self._page_workers.clear()
         # 关闭本地数据库连接池
         self.local_db.close_all()
         event.accept()
