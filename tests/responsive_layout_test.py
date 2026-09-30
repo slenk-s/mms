@@ -50,6 +50,7 @@ def test_navigation_collapses_and_expands_with_translated_tooltips(
         assert button.accessibleName() == tr(f"nav.{page_id}")
     assert navigation.logout_btn.text() == ""
     assert navigation.logout_btn.toolTip() == tr("nav.logout")
+    assert navigation.logout_btn.accessibleName() == tr("nav.logout")
     assert navigation.user_label.isHidden()
     assert navigation.lib_label.isHidden()
 
@@ -62,6 +63,7 @@ def test_navigation_collapses_and_expands_with_translated_tooltips(
         assert button.text() == tr(f"nav.{page_id}")
         assert button.accessibleName() == tr(f"nav.{page_id}")
     assert navigation.logout_btn.text() == tr("nav.logout")
+    assert navigation.logout_btn.accessibleName() == tr("nav.logout")
     assert navigation.user_label.text() == "👤 Alice\n[管理员]"
     assert navigation.lib_label.text() == tr("nav.local_library", name="测试库")
 

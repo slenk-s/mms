@@ -165,6 +165,7 @@ class NavigationBar(QWidget):
         logout_label = tr("nav.logout")
         self.logout_btn.setText("" if self._collapsed else logout_label)
         self.logout_btn.setToolTip(logout_label)
+        self.logout_btn.setAccessibleName(logout_label)
         self.user_label.setVisible(not self._collapsed)
         self.lib_label.setVisible(not self._collapsed)
         toggle_label = tr("nav.expand" if self._collapsed else "nav.collapse")
