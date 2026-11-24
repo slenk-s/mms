@@ -53,20 +53,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libqt6Widgets6 \
-            libqt6Gui6 \
-            libqt6Core6 \
+            libqt6widgets6 \
+            libqt6gui6 \
+            libqt6core6 \
             libgl1 \
             libxcb-xinerama0
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install PySide6 pymysql fastapi cython pytest PyJWT
+          pip install PySide6 pymysql fastapi cython pytest pytest-qt PyJWT
 
       - name: Build Cython extensions
         run: |
-          python client/pyd/setup.py build_ext --inplace || true
+          python client/pyd/setup.py
 
       - name: Run pytest
         env:

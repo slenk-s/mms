@@ -24,7 +24,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QThread, QProcess, QEvent
 from PySide6.QtGui import QFont, QGuiApplication, QColor
 
 from i18n import tr
-from widgets.toast import toast_success, toast_error, toast_info
+from widgets.toast import toast_success, toast_warning, toast_error, toast_info
 from utils.dialogs import show_confirm
 from utils.credential_manager import get_password
 from config import (
@@ -211,7 +211,7 @@ class ConfigGroup(QFrame):
             }}
         """)
         header_layout = QHBoxLayout(self._header)
-        header_layout.setContentsMargins(14, 10, 14, 10)
+        header_layout.setContentsMargins(12, 4, 12, 4)
 
         self._title_lbl = QLabel(f"{colors['icon']} {title}")
         self._title_lbl.setFont(QFont("Microsoft YaHei", 13, QFont.Weight.Bold))
@@ -221,6 +221,7 @@ class ConfigGroup(QFrame):
 
         self._toggle_btn = QLabel("▶")
         self._toggle_btn.setStyleSheet("color: #6b7280; font-size: 12px; background: transparent;")
+        self._header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         header_layout.addWidget(self._toggle_btn)
 
         self._header.mousePressEvent = self._on_toggle
@@ -530,7 +531,7 @@ class ConfigView(QWidget):
 
         scroll_content = QWidget()
         self._scroll_layout = QVBoxLayout(scroll_content)
-        self._scroll_layout.setSpacing(14)
+        self._scroll_layout.setSpacing(8)
         self._scroll_layout.setContentsMargins(0, 8, 8, 0)
 
         # ---------- 分组 ----------

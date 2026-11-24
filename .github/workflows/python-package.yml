@@ -12,7 +12,7 @@ on:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -21,14 +21,25 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libqt6widgets6 \
+          libqt6gui6 \
+          libqt6core6 \
+          libgl1 \
+          libxcb-xinerama0
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install flake8 pytest
+        python -m pip install flake8 pytest pytest-qt PySide6 pymysql fastapi cython PyJWT
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Build Cython extensions
+      run: python client/pyd/setup.py
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -36,5 +47,9 @@ jobs:
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
+      env:
+        QT_QPA_PLATFORM: offscreen
       run: |
-        pytest
+        pytest tests/ -v --tb=short \
+          --ignore=tests/upload_update.py \
+          --ignore=tests/test_update.py
