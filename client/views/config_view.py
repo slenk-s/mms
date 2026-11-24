@@ -223,12 +223,17 @@ class ConfigGroup(QFrame):
             }}
         """)
         header_layout = QHBoxLayout(self._header)
-        header_layout.setContentsMargins(14, 10, 14, 10)
+        header_layout.setContentsMargins(12, 4, 12, 4)
 
         self._toggle_btn = QPushButton(f"{colors['icon']} {title}")
         self._toggle_btn.setCheckable(True)
-        self._toggle_btn.setMinimumHeight(36)
-        self._toggle_btn.setStyleSheet("text-align: left; color: #374151; background: transparent; border: none;")
+        self._toggle_btn.setMinimumHeight(28)
+        # Override application-wide button padding/min-height to avoid double spacing.
+        self._toggle_btn.setStyleSheet(
+            "text-align: left; color: #374151; background: transparent;"
+            "border: none; padding: 2px 0; min-height: 0;"
+        )
+        self._header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self._toggle_btn.clicked.connect(lambda: self.activated.emit(self))
         self._header.mousePressEvent = lambda event: self.activated.emit(self)
         self._title_lbl = self._toggle_btn
@@ -602,7 +607,7 @@ class ConfigView(QWidget):
 
         scroll_content = QWidget()
         self._scroll_layout = QVBoxLayout(scroll_content)
-        self._scroll_layout.setSpacing(14)
+        self._scroll_layout.setSpacing(8)
         self._scroll_layout.setContentsMargins(0, 8, 8, 0)
 
         # ---------- 分组 ----------

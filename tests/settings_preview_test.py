@@ -53,3 +53,28 @@ def test_status_controls_scroll_into_view(view, width):
         QApplication.processEvents()
         assert control.visibleRegion().boundingRect().height() >= control.height()
     assert len(view.findChildren(StatusCard)) == 4
+
+@pytest.mark.parametrize('font_pixels', [12, 16, 20])
+def test_group_headers_compact_under_application_button_style(qtbot, font_pixels):
+    from views.config_view import ConfigGroup
+    from PySide6.QtWidgets import QWidget, QVBoxLayout
+    host = QWidget()
+    qtbot.addWidget(host)
+    host.setStyleSheet(
+        f'QPushButton {{ padding: 8px 20px; min-height: 32px; font-size: {font_pixels}px; }}'
+    )
+    layout = QVBoxLayout(host)
+    group = ConfigGroup('数据库配置', 'database')
+    layout.addWidget(group)
+    layout.addStretch()
+    host.resize(800, 300)
+    host.show()
+    QApplication.processEvents()
+    header = group._header
+    button = group._toggle_btn
+    assert header.height() <= max(40, button.fontMetrics().height() + 16)
+    margins = header.layout().contentsMargins()
+    assert margins.left() <= 12
+    assert margins.top() + margins.bottom() <= 8
+    assert button.height() >= button.fontMetrics().height()
+    assert button.width() >= button.fontMetrics().horizontalAdvance(button.text())
